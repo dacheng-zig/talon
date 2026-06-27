@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Core/http boundary guard (design doc §10): compile the engine rooted at
+    // Core/http boundary guard: compile the engine rooted at
     // src/core/ with only zio in the graph. Because Zig forbids importing files
     // outside a module's root dir, a stray core→http dependency (src/http/ is
     // outside src/core/) fails this compile. Compile-only — the engine's tests

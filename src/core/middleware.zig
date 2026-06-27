@@ -1,8 +1,8 @@
-//! Built-in connection middleware (design doc §5.3).
+//! Built-in connection middleware.
 //!
 //! Middleware signature: `fn (conn: *Connection, next: anytype) !void` —
 //! around-style; not calling next rejects the connection. TLS will be one
-//! of these (M4); PROXY protocol and logging already are.
+//! of these once implemented; PROXY protocol and logging already are.
 
 const std = @import("std");
 const zio = @import("zio");

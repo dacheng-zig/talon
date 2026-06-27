@@ -1,4 +1,4 @@
-//! Framing toolbox (design doc §8) — the Zig answer to Netty's codec framework.
+//! Framing toolbox — the Zig answer to Netty's codec framework.
 //!
 //! Three comptime components over `std.Io.Reader`'s buffered window, so a
 //! custom `Proto` author writes the protocol state machine, never buffer
@@ -13,7 +13,7 @@
 //! next `next()` call. All components carry a `max_frame` defense; a frame
 //! must also fit the reader's buffer capacity (size the buffer ≥ max_frame +
 //! frame header). Timeouts ride on the underlying reader (zio per-op
-//! Timeout). Stream side only — datagrams are already frames (§9).
+//! Timeout). Stream side only — datagrams are already frames.
 
 const std = @import("std");
 

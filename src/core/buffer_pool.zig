@@ -1,8 +1,8 @@
-//! Buffer pool (design doc §5.4).
+//! Buffer pool.
 //!
-//! M1: one size class per pool instance (the server runs one pool per
-//! purpose: read 16K, write 4K). M3 extends to the 4K/16K/64K three-tier
-//! free-list — the API is already per-size so that lands without churn.
+//! One size class per pool instance (the server runs one pool per
+//! purpose: read 16K, write 4K). A future 4K/16K/64K three-tier free-list
+//! extends this — the API is already per-size so that lands without churn.
 //!
 //! Debug borrow tracking (Netty ResourceLeakDetector lesson, lightweight):
 //! in Debug builds each rented buffer records its borrow site via

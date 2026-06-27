@@ -1,6 +1,6 @@
 //! In-process byte pipe with coroutine-blocking semantics.
 //!
-//! Building block of the memory transport (design doc §5.2): both ends of a
+//! Building block of the memory transport: both ends of a
 //! MemoryListener connection are `std.Io.Reader`/`std.Io.Writer` backed by a
 //! pair of these pipes, so the whole stack can be tested without sockets.
 

@@ -1,4 +1,4 @@
-//! HTTP hello-world on talon (design doc §10 examples).
+//! HTTP hello-world on talon.
 //!
 //! Run: zig build run-http
 //! Try: curl -v http://127.0.0.1:8080/
@@ -34,7 +34,7 @@ fn signalWatcher(server: *talon.http.Server(App)) !void {
 
 pub fn main(init: std.process.Init) !void {
     const rt = try zio.Runtime.init(init.gpa, .{
-        // §5.4: 256KB default committed stacks are the largest hidden cost at
+        // 256KB default committed stacks are the largest hidden cost at
         // 10k connections; 64KB is the engine's working point.
         .stack_pool = .{
             .maximum_size = 8 * 1024 * 1024,

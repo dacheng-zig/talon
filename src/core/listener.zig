@@ -1,4 +1,4 @@
-//! Listener abstraction (design doc §5.2).
+//! Listener abstraction.
 //!
 //! Comptime duck-typed contract, validated by StreamServer:
 //!   RawConnection: type           — the raw connection produced by accept()
@@ -11,7 +11,7 @@
 //!   close(self) void, shutdown(self) void, remoteInfo(self) RemoteInfo
 //!
 //! MemoryListener is a first-class citizen, not test scaffolding bolted on
-//! later (Kestrel TestServer lesson, §3).
+//! later (Kestrel TestServer lesson).
 
 const std = @import("std");
 const zio = @import("zio");
@@ -83,7 +83,7 @@ pub const TcpListener = struct {
     pub fn accept(self: *TcpListener) !TcpConnection {
         const stream = try self.server.accept(.{});
         // Latency over throughput by default; response writes are already
-        // batched through the buffered Writer (§10: TCP_NODELAY).
+        // batched through the buffered Writer (TCP_NODELAY).
         stream.socket.setNoDelay(true) catch {};
         return .{ .stream = stream };
     }

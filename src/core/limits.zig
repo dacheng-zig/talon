@@ -1,13 +1,13 @@
-//! Server limits and slow-attack defense knobs (design doc §5.6).
+//! Server limits and slow-attack defense knobs.
 //!
-//! The struct and its counting points are reserved from M0 so that the M3
+//! The struct and its counting points are reserved up front so that the
 //! data-rate defense lands without rewriting the connection loop.
 
 const zio = @import("zio");
 
 /// Minimum acceptable data rate, used to defend against slow-body attacks
-/// (Kestrel MinRequestBodyDataRate equivalent). Enforced by the server-level
-/// heartbeat coroutine starting at M3.
+/// (Kestrel MinRequestBodyDataRate equivalent). Enforcement by the server-level
+/// heartbeat coroutine is not yet implemented.
 pub const DataRate = struct {
     bytes_per_sec: u64,
     /// Grace period before the rate is enforced on a fresh transfer.
@@ -22,7 +22,6 @@ pub const Limits = struct {
     header_read_timeout: zio.Timeout = .fromSeconds(10),
     keep_alive_timeout: zio.Timeout = .fromSeconds(75),
     drain_timeout: zio.Timeout = .fromSeconds(30),
-    /// M3: slow-attack defense (Slowloris / slow body). Parsed but not yet
-    /// enforced before M3.
+    /// Slow-attack defense (Slowloris / slow body). Parsed but not yet enforced.
     min_body_data_rate: ?DataRate = .{ .bytes_per_sec = 240, .grace = .fromSeconds(5) },
 };

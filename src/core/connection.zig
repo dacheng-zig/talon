@@ -1,4 +1,4 @@
-//! Protocol-facing connection wrapper (design doc §5.1).
+//! Protocol-facing connection wrapper.
 //!
 //! `Connection(Raw)` is what a `Proto.serve` implementation receives: buffered
 //! `std.Io.Reader`/`std.Io.Writer` access, shutdown signal, deadline control,
@@ -34,7 +34,7 @@ pub fn Connection(comptime Raw: type) type {
         shutting_down: *const std.atomic.Value(bool),
         /// Per-connection arena for request-scoped allocations; protocols
         /// reset it between requests (`reset(.retain_capacity)`) so the
-        /// steady-state hot path is malloc-free (§5.4).
+        /// steady-state hot path is malloc-free.
         arena: *std.heap.ArenaAllocator,
         /// Middleware-provided remote identity (e.g. PROXY protocol);
         /// overrides the transport's own when set.
@@ -62,7 +62,7 @@ pub fn Connection(comptime Raw: type) type {
         }
 
         /// Buffered reader over the connection (post-middleware once the
-        /// connection middleware chain lands in M1).
+        /// connection middleware chain is implemented).
         pub fn reader(self: *Self) *std.Io.Reader {
             return &self.reader_state.interface;
         }
@@ -72,7 +72,7 @@ pub fn Connection(comptime Raw: type) type {
         }
 
         /// True once graceful shutdown started; protocols should finish the
-        /// in-flight request and exit their connection loop (§5.8).
+        /// in-flight request and exit their connection loop.
         pub fn isShuttingDown(self: *const Self) bool {
             return self.shutting_down.load(.acquire);
         }
@@ -88,7 +88,7 @@ pub fn Connection(comptime Raw: type) type {
         }
 
         /// Per-read deadline (kernel-level zio Timeout). No-op on transports
-        /// without timeout support (memory pipes) — M0 limitation.
+        /// without timeout support (memory pipes) — current limitation.
         pub fn setReadTimeout(self: *Self, timeout: zio.Timeout) void {
             if (comptime std.meta.hasMethod(Raw.Reader, "setTimeout")) {
                 self.reader_state.setTimeout(timeout);
@@ -103,7 +103,7 @@ pub fn Connection(comptime Raw: type) type {
 
         pub const WaitReadableError = error{
             /// Graceful shutdown was requested while idle — the protocol
-            /// should exit its connection loop (request-boundary exit, §5.8).
+            /// should exit its connection loop (request-boundary exit).
             ShuttingDown,
             /// `budget` elapsed without any data (e.g. keep-alive idle timeout).
             Timeout,
@@ -117,8 +117,8 @@ pub fn Connection(comptime Raw: type) type {
         /// `budget` elapses.
         ///
         /// Implemented as short kernel-timeout read ticks with a shutdown
-        /// check in between — the same 1s cadence as the §5.6 heartbeat,
-        /// which takes over the wakeup duty in M3. Without this, idle
+        /// check in between — the same 1s cadence as the heartbeat,
+        /// which will take over the wakeup duty once implemented. Without this, idle
         /// keep-alive connections only die via the drain-timeout cancel,
         /// making shutdown take the full drain window.
         ///
@@ -157,12 +157,12 @@ pub fn Connection(comptime Raw: type) type {
             }
         }
 
-        /// Hijack primitive (§5.7): hands the raw connection to the caller and
+        /// Hijack primitive: hands the raw connection to the caller and
         /// marks it so the server skips its own shutdown/close when serve
-        /// returns. M0 contract: the hijacker owns close(); the Connection's
+        /// returns. Current contract: the hijacker owns close(); the Connection's
         /// reader/writer buffers stay valid only within Proto.serve's dynamic
         /// extent — re-buffer if the connection outlives it (full ownership
-        /// transfer is M3 scope).
+        /// transfer is not yet implemented).
         pub fn hijack(self: *Self) Raw {
             self.hijacked = true;
             return self.raw;

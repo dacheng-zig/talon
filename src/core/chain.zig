@@ -1,4 +1,4 @@
-//! Generic middleware chain combinator (design doc §7).
+//! Generic middleware chain combinator.
 //!
 //! One mechanism serves three consumers: talon connection-level middleware,
 //! talon datagram packet-level middleware, and wing request-level middleware.
@@ -13,12 +13,12 @@
 //!
 //! `requires` is checked at comptime against the `provides` of all earlier
 //! middlewares in the chain, turning middleware-ordering bugs into compile
-//! errors (§7: "五个参照系统都没有的能力").
+//! errors.
 //!
 //! Inside a middleware, call `try next.call(ctx)` to continue the chain;
 //! returning without calling `next` short-circuits it. Code before `next`
 //! runs inbound, code after runs outbound — a single around-style
-//! abstraction is naturally bidirectional (§3, Netty inbound/outbound 裁决).
+//! abstraction is naturally bidirectional (Netty inbound/outbound style).
 
 const std = @import("std");
 
@@ -33,7 +33,7 @@ pub fn chain(comptime Ctx: type, comptime middlewares: anytype) type {
 
     return struct {
         /// Comptime capability query: does any middleware in this chain
-        /// declare `F` in its `provides`? Used by Connection type synthesis (§6).
+        /// declare `F` in its `provides`? Used by Connection type synthesis.
         pub fn provides(comptime F: type) bool {
             comptime var i: usize = 0;
             inline while (i < count) : (i += 1) {
@@ -308,7 +308,7 @@ test "chain: terminal handler can be a stateful value with a call method" {
     try std.testing.expectEqual(1, hits);
 }
 
-// Capability types for provides/requires tests (§6: capabilities are types).
+// Capability types for provides/requires tests (capabilities are types).
 const TlsInfo = struct { cipher: []const u8 };
 const PeerInfo = struct { addr: u32 };
 
@@ -344,7 +344,7 @@ test "chain: provides() comptime capability query" {
 }
 
 // Generic middleware (anytype ctx) is reusable across context types — the
-// comptime version of tower's ecosystem effect (§7).
+// comptime version of tower's ecosystem effect.
 const OtherCtx = struct {
     count: u32 = 0,
 };

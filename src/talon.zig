@@ -1,5 +1,4 @@
-//! talon: the single public module = protocol-agnostic engine + HTTP package
-//! (design doc §2).
+//! talon: the single public module = protocol-agnostic engine + HTTP package.
 //!
 //! The top-level surface is the engine (in src/core/, surfaced here as
 //! `talon.core` plus flattened aliases for convenience); the HTTP/1.1 protocol
@@ -20,7 +19,7 @@ pub const MemoryListener = core.MemoryListener;
 pub const chain = core.chain;
 pub const middleware = core.middleware;
 
-/// The HTTP/1.1 protocol package (§5.5): `Server(App)`, `Request`/`Response`,
+/// The HTTP/1.1 protocol package: `Server(App)`, `Request`/`Response`,
 /// and the surrounding request/response types.
 pub const http = @import("http/http.zig");
 

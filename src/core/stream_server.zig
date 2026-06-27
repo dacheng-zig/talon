@@ -1,8 +1,8 @@
-//! StreamServer: protocol-agnostic stream engine (design doc §5).
+//! StreamServer: protocol-agnostic stream engine.
 //!
 //! `Proto` is a comptime contract: given a ready connection, it decides how to
 //! speak. Implement one `Proto.serve` and inherit the engine's foundation —
-//! listener abstraction, connection limits, graceful shutdown, and (from M1)
+//! listener abstraction, connection limits, graceful shutdown, plus
 //! connection middleware, buffer pool, and the framing toolbox.
 //!
 //!   Proto.serve(conn: *Connection(Raw), app: *App) anyerror!void
@@ -23,7 +23,7 @@ const BufferPool = buffer_pool.BufferPool;
 
 const log = std.log.scoped(.talon);
 
-// §5.4 size classes (M1: one pool per purpose; M3 generalizes).
+// Size classes (one pool per purpose; a future tier generalizes this).
 const write_buffer_size = 4 * 1024;
 
 /// StreamServer without connection middleware.
@@ -31,7 +31,7 @@ pub fn StreamServer(comptime Proto: type, comptime App: type) type {
     return StreamServerWith(Proto, App, .{});
 }
 
-/// StreamServer with a comptime connection middleware chain (§5.3). Each
+/// StreamServer with a comptime connection middleware chain. Each
 /// middleware is `fn (conn: *Connection, next: anytype) !void` (or a struct
 /// type with `run`); it may inspect/wrap the connection, publish remote
 /// identity, or reject by returning without calling next.
@@ -54,7 +54,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         stop_event: zio.ResetEvent = .init,
         accept_error: ?anyerror = null,
         /// Read buffers double as the head accumulation window, so they are
-        /// sized to limits.max_header_size (16K default — §5.4 read class).
+        /// sized to limits.max_header_size (16K default — read class).
         read_pool: BufferPool,
         write_pool: BufferPool,
 
@@ -83,7 +83,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         }
 
         /// Call after serve() has returned. In Debug builds this also
-        /// reports any buffer rented but never returned (§5.4).
+        /// reports any buffer rented but never returned.
         pub fn deinit(self: *Self) void {
             self.read_pool.deinit();
             self.write_pool.deinit();
@@ -91,10 +91,10 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
 
         /// Runs the server. Blocks the calling coroutine until shutdown() is
         /// requested (or the listener fails), then drains in-flight
-        /// connections per §5.8 and returns. Closes the listener.
+        /// connections and returns. Closes the listener.
         ///
         /// `listener` is a pointer to any type satisfying the listener
-        /// contract (§5.2): accept() / close() / RawConnection.
+        /// contract: accept() / close() / RawConnection.
         ///
         /// The accept loop runs as an internal task so that shutdown can
         /// interrupt a pending accept via zio task cancellation — closing the
@@ -117,7 +117,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
             if (self.accept_error) |err| return err;
         }
 
-        /// Requests graceful shutdown (§5.8): stop accepting, signal
+        /// Requests graceful shutdown: stop accepting, signal
         /// shutting_down so connections exit at request boundaries. serve()
         /// then waits up to limits.drain_timeout before hard-canceling.
         /// Idempotent; callable from any task or thread.
@@ -216,7 +216,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
                     );
                     // Hijacked connections become the hijacker's to close;
                     // note the pooled buffers still return above, so a
-                    // hijacker must re-buffer (M0/M1 hijack contract).
+                    // hijacker must re-buffer (current hijack contract).
                     defer if (!conn.hijacked) {
                         raw.shutdown();
                         raw.close();
@@ -247,7 +247,7 @@ fn validateListener(comptime L: type) void {
     inline for (.{ "accept", "close" }) |decl| {
         if (!@hasDecl(L, decl)) {
             @compileError("talon.StreamServer.serve: listener type '" ++ @typeName(L) ++
-                "' is missing '" ++ decl ++ "' (listener contract, design doc §5.2)");
+                "' is missing '" ++ decl ++ "' (listener contract)");
         }
     }
     if (!@hasDecl(L, "RawConnection")) {

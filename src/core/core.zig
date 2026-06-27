@@ -1,8 +1,8 @@
-//! talon-core: protocol-agnostic network service engine (design doc §2).
+//! talon-core: protocol-agnostic network service engine.
 //!
-//! Stream engine (M0) + shared foundation. The datagram sibling engine
-//! (DatagramServer + SessionTable, §9) is M3 scope, demand-driven; the shared
-//! foundation here is already designed for both consumers.
+//! Stream engine + shared foundation. The datagram sibling engine
+//! (DatagramServer + SessionTable) is not yet implemented, demand-driven; the
+//! shared foundation here is already designed for both consumers.
 
 const std = @import("std");
 
