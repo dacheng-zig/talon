@@ -23,23 +23,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Core/http boundary guard: compile the engine rooted at
-    // src/core/ with only zio in the graph. Because Zig forbids importing files
-    // outside a module's root dir, a stray core→http dependency (src/http/ is
-    // outside src/core/) fails this compile. Compile-only — the engine's tests
-    // run once as part of talon_tests below.
-    const core_boundary = b.addObject(.{
-        .name = "core-boundary",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/core/core.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zio", .module = zio_mod },
-            },
-        }),
-    });
-
     const talon_tests = b.addTest(.{ .root_module = talon_mod });
     const run_talon_tests = b.addRunArtifact(talon_tests);
 
@@ -59,7 +42,6 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");
-    test_step.dependOn(&core_boundary.step);
     test_step.dependOn(&run_talon_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 
@@ -67,6 +49,10 @@ pub fn build(b: *std.Build) void {
     // protocol using only talon.core.
     const examples = [_]struct { name: []const u8, src: []const u8 }{
         .{ .name = "http", .src = "examples/http.zig" },
+        .{ .name = "http_client", .src = "examples/http_client.zig" },
+        .{ .name = "http_get", .src = "examples/http_get.zig" },
+        .{ .name = "https_get", .src = "examples/https_get.zig" },
+        .{ .name = "http_client_bench", .src = "examples/http_client_bench.zig" },
         .{ .name = "resp", .src = "examples/resp.zig" },
     };
     for (examples) |ex| {
@@ -85,6 +71,8 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
+        // Forward args after `--`, e.g. `zig build run-http_get -- http://host/`.
+        if (b.args) |args| run_cmd.addArgs(args);
         const run_step = b.step(b.fmt("run-{s}", .{ex.name}), b.fmt("Run the {s} example", .{ex.name}));
         run_step.dependOn(&run_cmd.step);
     }

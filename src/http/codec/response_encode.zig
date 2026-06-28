@@ -1,17 +1,18 @@
-//! Response encoding (design doc §5.5 write path).
+//! Response encoding (write path).
 //!
 //! The head is printed into the connection's buffered writer; a fixed-length
 //! body then rides the same flush, which zio's Writer drains with a single
 //! vectored syscall (buffered head + body slices via writeSplatHeader) — the
-//! §10 "writeVec 合并响应" path without explicit iovec plumbing here.
+//! coalesced writeVec path without explicit iovec plumbing here.
 
 const std = @import("std");
 const zio = @import("zio");
-const parser = @import("parser.zig");
+const parser = @import("request_parser.zig");
+const codec = @import("codec.zig");
 
-pub const Status = std.http.Status;
+pub const Status = codec.Status;
 
-/// RFC 9110 Date header value, cached per second (§10). One instance per
+/// RFC 9110 Date header value, cached per second. One instance per
 /// connection: no synchronization, and keep-alive loops amortize the
 /// formatting.
 pub const DateCache = struct {
@@ -62,9 +63,30 @@ pub const HeadOptions = struct {
     keep_alive: bool = true,
 };
 
+pub const EncodeError = error{
+    /// An app-supplied header name/value contained bytes that would break
+    /// framing (CR/LF, control chars). The encoder refuses to emit it,
+    /// closing the response-splitting vector (CWE-113) at the framework level
+    /// instead of trusting every handler to sanitize.
+    InvalidHeader,
+};
+
 /// Prints the status line + standard headers + extra headers + blank line
 /// into `w` (the connection's buffered writer). Does not flush.
-pub fn writeHead(w: *std.Io.Writer, date: *DateCache, options: HeadOptions) !void {
+///
+/// App-supplied `extra_headers` are validated for injection first; standard
+/// headers (status phrase, date) are framework-generated and trusted.
+pub fn writeHead(w: *std.Io.Writer, date: *DateCache, options: HeadOptions) (std.Io.Writer.Error || EncodeError)!void {
+    for (options.extra_headers) |h| {
+        if (!parser.isToken(h.name) or !parser.validFieldValue(h.value)) return error.InvalidHeader;
+        // Reject app-supplied framing headers: the encoder emits the framing
+        // (content-length/transfer-encoding/connection) and Date from its typed
+        // options/standard headers, so a duplicate here is a response-splitting
+        // vector (CL+TE, second Content-Length). Symmetric with the parser's
+        // ConflictingFraming rejection (CWE-113).
+        if (parser.isReservedFramingHeader(h.name) or std.ascii.eqlIgnoreCase(h.name, "date"))
+            return error.InvalidHeader;
+    }
     const code = @intFromEnum(options.status);
     const phrase = options.status.phrase() orelse "";
     try w.print("HTTP/1.1 {d} {s}\r\ndate: {s}\r\n", .{ code, phrase, date.get() });
@@ -138,6 +160,29 @@ test "formatHttpDate: known timestamps" {
     // 2026-06-11 08:30:00 UTC
     formatHttpDate(1781166600, &buf);
     try std.testing.expectEqualStrings("Thu, 11 Jun 2026 08:30:00 GMT", &buf);
+}
+
+test "writeHead: rejects CRLF injection in app headers" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var date: DateCache = .{};
+    try std.testing.expectError(error.InvalidHeader, writeHead(&w, &date, .{
+        .content_length = 0,
+        .extra_headers = &.{.{ .name = "x", .value = "a\r\nSet-Cookie: evil=1" }},
+    }));
+}
+
+test "writeHead: rejects app-supplied framing headers (response splitting)" {
+    var buf: [256]u8 = undefined;
+    var date: DateCache = .{};
+    const reserved = [_][]const u8{ "Content-Length", "transfer-encoding", "connection", "Date" };
+    for (reserved) |name| {
+        var w: std.Io.Writer = .fixed(&buf);
+        try std.testing.expectError(error.InvalidHeader, writeHead(&w, &date, .{
+            .content_length = 0,
+            .extra_headers = &.{.{ .name = name, .value = "0" }},
+        }));
+    }
 }
 
 test "writeHead: fixed-length keep-alive response" {

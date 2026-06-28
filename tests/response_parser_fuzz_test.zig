@@ -1,27 +1,27 @@
-//! Fuzz / property tests for the HTTP head parser: the parser
-//! must never crash on arbitrary or mutated input. Driven through the public
-//! talon.http.codec.request_parser surface.
+//! Fuzz / property tests for the HTTP response head parser: the parser
+//! must never crash on arbitrary or mutated input. Driven
+//! through the public talon.http.codec.response_parser surface.
 
 const std = @import("std");
 const talon = @import("talon");
 
-const parser = talon.http.codec.request_parser;
-const parse = parser.parse;
-const Header = parser.Header;
-const max_headers = parser.max_headers;
+const response_parser = talon.http.codec.response_parser;
+const parse = response_parser.parse;
+const Header = response_parser.Header;
+const max_headers = response_parser.max_headers;
 
-test "fuzz-lite: 200k mutated inputs never crash the parser" {
-    // Deterministic in-process fuzzing: `zig build test --fuzz` is currently
-    // broken in the 0.16 toolchain (test_runner fails to rebuild in fuzz
-    // mode), so this provides the fuzz no-crash evidence directly.
-    var prng = std.Random.DefaultPrng.init(0xdac4e16);
+test "fuzz-lite: 200k mutated inputs never crash the response parser" {
+    // Deterministic in-process fuzzing: `zig build test --fuzz` is broken in
+    // the 0.16 toolchain, so this provides the fuzz no-crash evidence.
+    var prng = std.Random.DefaultPrng.init(0xc0de_5ee5);
     const random = prng.random();
 
     const seeds = [_][]const u8{
-        "GET / HTTP/1.1\r\nHost: h\r\n\r\n",
-        "POST /a/b?c=d HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\nX-Y: z\r\n\r\n",
-        "PUT /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
-        "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-y: z\r\n\r\n",
+        "HTTP/1.0 301 Moved\r\nlocation: /a\r\n\r\n",
+        "HTTP/1.1 204\r\n\r\n",
     };
 
     var buf: [512]u8 = undefined;
@@ -31,7 +31,6 @@ test "fuzz-lite: 200k mutated inputs never crash the parser" {
         var len = seed.len;
         @memcpy(buf[0..len], seed);
 
-        // Mutate: byte flips, truncation, growth with random bytes.
         for (0..random.uintLessThan(usize, 8)) |_| {
             switch (random.uintLessThan(u8, 3)) {
                 0 => buf[random.uintLessThan(usize, len)] = random.int(u8),
@@ -48,7 +47,7 @@ test "fuzz-lite: 200k mutated inputs never crash the parser" {
     }
 }
 
-test "fuzz: parser never crashes on arbitrary input" {
+test "fuzz: response parser never crashes on arbitrary input" {
     const Ctx = struct {
         fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
             var buf: [2048]u8 = undefined;
@@ -58,7 +57,7 @@ test "fuzz: parser never crashes on arbitrary input" {
         }
     };
     try std.testing.fuzz(Ctx{}, Ctx.testOne, .{ .corpus = &.{
-        "GET / HTTP/1.1\r\nHost: h\r\n\r\n",
-        "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n",
     } });
 }

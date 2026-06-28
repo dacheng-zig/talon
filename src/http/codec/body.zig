@@ -1,13 +1,13 @@
-//! Request body reader (design doc §5.5): a `std.Io.Reader` over the
-//! connection reader, decoding either Content-Length-bounded or chunked
-//! framing. Streaming — never buffers the whole body.
+//! HTTP body reader (direction-neutral): a `std.Io.Reader` over the
+//! connection reader, decoding Content-Length-bounded, chunked, or (response
+//! only) close-delimited framing. Streaming — never buffers the whole body.
 //!
 //! Strictness (smuggling defense, parser.zig's counterpart on the body
 //! side): chunk sizes are bare hex (no extensions, no 0x prefix), lines end
 //! with exact CRLF, trailers are rejected.
 
 const std = @import("std");
-const parser = @import("parser.zig");
+const parser = @import("request_parser.zig");
 
 pub const BodyError = error{
     /// Stream ended before the declared body length.
@@ -36,6 +36,10 @@ pub const BodyReader = struct {
         /// Remaining bytes of a Content-Length body.
         content_length: u64,
         chunked: ChunkState,
+        /// Close-delimited response body: no Content-Length, no chunked.
+        /// Reads until upstream EOF, which is the clean terminator (not
+        /// truncation). Response-only — the request `init` never produces it.
+        until_close,
     };
 
     const ChunkState = enum {
@@ -54,6 +58,8 @@ pub const BodyReader = struct {
         max_body: ?u64,
         buffer: []u8,
     ) BodyReader {
+        // Request framing: chunked → CL → none. A request with neither is
+        // bodyless (never close-delimited — that is a response-only mode).
         const state: State = if (head.transfer_chunked)
             .{ .chunked = .size_line }
         else if (head.content_length) |cl|
@@ -61,6 +67,39 @@ pub const BodyReader = struct {
         else
             .none;
 
+        return fromState(upstream, state, max_body, buffer);
+    }
+
+    /// Response body framing, derived by the client from status + method.
+    pub const ResponseFraming = struct {
+        transfer_chunked: bool,
+        content_length: ?u64,
+        /// False for HEAD responses and 1xx/204/304: no body regardless of
+        /// any framing headers present (the client decides this).
+        has_body: bool,
+    };
+
+    /// Response-side constructor (client). Unlike requests, a body with no
+    /// Content-Length and no chunked coding is close-delimited (read to EOF).
+    pub fn initResponse(
+        upstream: *std.Io.Reader,
+        framing: ResponseFraming,
+        max_body: ?u64,
+        buffer: []u8,
+    ) BodyReader {
+        const state: State = if (!framing.has_body)
+            .none
+        else if (framing.transfer_chunked)
+            .{ .chunked = .size_line }
+        else if (framing.content_length) |cl|
+            (if (cl == 0) .none else .{ .content_length = cl })
+        else
+            .until_close;
+
+        return fromState(upstream, state, max_body, buffer);
+    }
+
+    fn fromState(upstream: *std.Io.Reader, state: State, max_body: ?u64, buffer: []u8) BodyReader {
         return .{
             .upstream = upstream,
             .state = state,
@@ -100,6 +139,30 @@ pub const BodyReader = struct {
                 const n = try self.streamFromUpstream(io_w, limit, remaining);
                 self.state = .{ .content_length = remaining - n };
                 return n;
+            },
+            .until_close => {
+                // Close-delimited: copy whatever upstream has; EOF is the
+                // clean terminator here (not TruncatedBody).
+                const up = self.upstream;
+                if (up.bufferedLen() == 0) {
+                    up.fillMore() catch |err| switch (err) {
+                        error.EndOfStream => return error.EndOfStream,
+                        error.ReadFailed => return self.fail(error.ReadFailed),
+                    };
+                }
+                const window = up.buffered();
+                const n = limit.minInt(window.len);
+                if (n == 0) return 0;
+                const dest = io_w.writableSliceGreedy(1) catch return error.WriteFailed;
+                const copied = @min(n, dest.len);
+                if (self.max_body) |max| {
+                    if (self.produced + copied > max) return self.fail(error.BodyTooLarge);
+                }
+                @memcpy(dest[0..copied], window[0..copied]);
+                io_w.advance(copied);
+                up.toss(copied);
+                self.produced += copied;
+                return copied;
             },
             .chunked => |*chunk_state| {
                 while (true) {
@@ -150,12 +213,14 @@ pub const BodyReader = struct {
         n = limit.minInt(n);
         if (n == 0) return 0;
 
-        if (self.max_body) |max| {
-            if (self.produced + n > max) return self.fail(error.BodyTooLarge);
-        }
-
         const dest = io_w.writableSliceGreedy(1) catch return error.WriteFailed;
         const copied = @min(n, dest.len);
+        // Enforce on bytes actually produced (copied), not the larger window
+        // (n): a destination smaller than the window must not trip the limit
+        // early. `produced` is accumulated by `copied`, so the check matches.
+        if (self.max_body) |max| {
+            if (self.produced + copied > max) return self.fail(error.BodyTooLarge);
+        }
         @memcpy(dest[0..copied], window[0..copied]);
         io_w.advance(copied);
         up.toss(copied);

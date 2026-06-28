@@ -25,6 +25,13 @@ const log = std.log.scoped(.talon);
 
 // Size classes (one pool per purpose; a future tier generalizes this).
 const write_buffer_size = 4 * 1024;
+/// Read-buffer slack over max_header_size (codec/head.zig precondition).
+const head_buffer_slack = 1024;
+
+/// Backoff after `accept()` hits an fd-exhaustion error. A slow-handler burst
+/// can momentarily pin every fd; we pause rather than busy-spin retrying
+/// `accept()` (which would just keep failing and peg the executor).
+const accept_fd_backoff_ms = 10;
 
 /// StreamServer without connection middleware.
 pub fn StreamServer(comptime Proto: type, comptime App: type) type {
@@ -66,7 +73,12 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
 
         pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Self {
             var read_pool = try BufferPool.init(gpa, .{
-                .buffer_size = @max(options.limits.max_header_size, 1024),
+                // Slack over max_header_size so the head scanner trips its
+                // "> max_header_size" guard before the buffer fills — sizing
+                // the buffer EQUAL to the limit would let a full-buffer head
+                // with no terminator hit fillMore on a full buffer (panic /
+                // spin). See codec/head.zig precondition.
+                .buffer_size = @max(options.limits.max_header_size, 1024) + head_buffer_slack,
             });
             errdefer read_pool.deinit();
             const write_pool = try BufferPool.init(gpa, .{
@@ -137,13 +149,30 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
 
                         const raw = listener.accept() catch |err| {
                             server.conn_sem.post();
-                            switch (err) {
-                                error.Canceled => {},
+                            // Widen to `anyerror`: a listener's accept error set
+                            // may not name the fd-exhaustion errors, but we still
+                            // want to match them when it does (e.g. TcpListener).
+                            switch (@as(anyerror, err)) {
+                                error.Canceled => return,
+                                // FD exhaustion is transient: a burst of slow
+                                // handlers can momentarily pin every fd. Back
+                                // off and keep serving rather than tearing down
+                                // the listener — which would also drop every
+                                // healthy in-flight connection.
+                                error.ProcessFdQuotaExceeded,
+                                error.SystemFdQuotaExceeded,
+                                => {
+                                    log.warn("accept: fd limit reached ({t}); backing off {d}ms", .{ err, accept_fd_backoff_ms });
+                                    zio.sleep(zio.Duration.fromMilliseconds(accept_fd_backoff_ms)) catch return;
+                                    continue;
+                                },
                                 // Anything else is a fatal listener failure;
                                 // surface it from serve() after the drain.
-                                else => server.accept_error = err,
+                                else => {
+                                    server.accept_error = err;
+                                    return;
+                                },
                             }
-                            return;
                         };
 
                         server.group.spawn(ConnTask(L.RawConnection).run, .{ server, raw }) catch |err| {

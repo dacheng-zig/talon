@@ -56,7 +56,7 @@
 **对上层（wing 及任何使用方）的公开契约**——semver 边界，破坏性变更走 major：
 
 1. `Server(App)` comptime 泛型（App 提供 `handle(req, res)`）
-2. `Request` / `Response` / `BodyReader` 类型（Reader/Writer 保持 `std.Io` 接口）
+2. `Request` / `Response` 类型（`talon.http`）；HTTP 编解码词汇 `BodyReader` / `Header` / `Method` / 解析器等在 `talon.http.codec`（Reader/Writer 保持 `std.Io` 接口）
 3. `req.hijack()` 连接劫持原语
 4. feature 查询（§6）
 5. `chain` 组合器（wing 的请求级中间件复用它，权威定义在 §7）
@@ -358,7 +358,7 @@ talon/                             # dacheng-zig/talon
 
 | 里程碑 | 内容                                                                                                                                                                         | 验收 |
 |--------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| **M0** | talon core 骨架：StreamServer + TcpListener + MemoryListener + Semaphore 限额 + 优雅停机 + chain 组合器（接口按 stream/datagram 双消费者审视）；HTTP 协议层借 `std.http.Server`；RESP echo 示例验证 core 契约 | 功能正确；wrk 基线；RESP 示例只用 core 契约、不触 http/ 代码（边界由隔离的 `core-boundary` 编译守卫强制） |
+| **M0** | talon core 骨架：StreamServer + TcpListener + MemoryListener + Semaphore 限额 + 优雅停机 + chain 组合器（接口按 stream/datagram 双消费者审视）；HTTP 协议层借 `std.http.Server`；RESP echo 示例验证 core 契约 | 功能正确；wrk 基线；RESP 示例只用 core 契约、不触 http/ 代码（边界由 module 根目录隔离维持，约定保障） |
 | **M1** | 自研 http1 解析器 + 零拷贝 + arena + buffer pool（含 debug 借出追踪）+ writeVec，替换 std.http；连接中间件链（先 conn_log + proxy_protocol）；framing 工具箱（RESP 示例改用 Delimited）                          | 吞吐显著超 M0；fuzz 无 crash；走私用例全拒绝；framing 三组件有独立测试 |
 | **M3** | 生产化：hijack 原语完善、数据速率防御 + 心跳、指标钩子、SO_REUSEPORT、buffer pool 多 size class；**DatagramServer + SessionTable（需求驱动，无真实 UDP 协议需求则顺延）**                                             | 24h 长稳无泄漏（GPA leak check + pool 借出追踪零未还）；Slowloris 用例防御生效 |
 | **M4** | TLS 连接中间件、AutoProtocol/h2 评估、QUIC/HTTP3 预研（基于 DatagramServer + SessionTable）                                                                                               | 另立设计文档 |

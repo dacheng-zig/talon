@@ -1,12 +1,12 @@
-//! Tests for talon.http.BodyReader: content-length and chunked decoding,
+//! Tests for talon.http.codec.BodyReader: content-length and chunked decoding,
 //! strictness (smuggling defense), max-body enforcement, and discard — driven
 //! over a fixed in-memory reader through the public API.
 
 const std = @import("std");
 const talon = @import("talon");
 
-const BodyReader = talon.http.BodyReader;
-const Head = talon.http.parser.Head;
+const BodyReader = talon.http.codec.BodyReader;
+const Head = talon.http.codec.request_parser.Head;
 
 fn makeHead(content_length: ?u64, chunked: bool) Head {
     return .{

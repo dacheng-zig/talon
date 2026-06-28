@@ -1,11 +1,11 @@
-//! Http1Protocol: the HTTP/1.1 connection loop (design doc §5.5), a `Proto`
+//! Http1Protocol: the HTTP/1.1 connection loop, a `Proto`
 //! implementation for talon-core's StreamServer.
 //!
-//! Per request: accumulate head (hand-written Accumulator specialization,
-//! §8) → copy to arena → pure-function parse → handler → drain body →
-//! keep-alive or close. Hot path allocates only from the per-connection
+//! Per request: accumulate head (hand-written Accumulator
+//! specialization) → copy to arena → pure-function parse → handler → drain
+//! body → keep-alive or close. Hot path allocates only from the per-connection
 //! arena, which resets between requests with retained capacity — steady
-//! state is malloc-free (§5.4).
+//! state is malloc-free.
 //!
 //! Why the arena copy of the head: header slices must stay valid while the
 //! handler reads the body through the same `std.Io.Reader`, whose buffer
@@ -13,9 +13,10 @@
 //! correctness without giving up the zero-copy parse.
 
 const std = @import("std");
-const parser = @import("parser.zig");
-const body_mod = @import("body.zig");
-const encode = @import("encode.zig");
+const parser = @import("codec/request_parser.zig");
+const body_mod = @import("codec/body.zig");
+const encode = @import("codec/response_encode.zig");
+const head_scan = @import("codec/head.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
 
@@ -57,11 +58,11 @@ pub fn Http1Protocol(comptime App: type) type {
                 if (r.bufferedLen() == 0) w.flush() catch return;
 
                 // Request-boundary idle wait: interruptible by shutdown,
-                // bounded by the keep-alive budget (§5.6/§5.8).
+                // bounded by the keep-alive budget.
                 conn.waitReadable(conn.limits.keep_alive_timeout) catch return;
                 conn.setReadTimeout(conn.limits.header_read_timeout);
 
-                const head_len = findHeadEnd(r, w, conn.limits.max_header_size) catch |err| switch (err) {
+                const head_len = head_scan.findHeadEnd(r, conn.limits.max_header_size, w) catch |err| switch (err) {
                     error.CleanClose => return,
                     error.HeadersTooLarge => {
                         return respondErrorAndClose(w, &date_cache, .request_header_fields_too_large);
@@ -98,7 +99,7 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 if (head.expect_continue) {
                     // Eager 100-continue (Kestrel defers to first body read;
-                    // M1 keeps it simple).
+                    // this keeps it simple).
                     w.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
                     w.flush() catch return;
                 }
@@ -107,7 +108,15 @@ pub fn Http1Protocol(comptime App: type) type {
                 var res: Response = .{
                     .out = w,
                     .date = &date_cache,
-                    .keep_alive = head.keep_alive,
+                    // HTTP/1.0 persistence requires an explicit
+                    // `Connection: keep-alive` in the response, but the encoder
+                    // emits an HTTP/1.1 status line and no such header — so a 1.0
+                    // connection cannot be correctly persisted. Treat 1.0 as
+                    // non-persistent (RFC 9112 §9.3): the response then carries
+                    // `connection: close` and the loop below closes, instead of
+                    // holding a socket the 1.0 peer believes is already closed.
+                    // `respond()` may only narrow this, never re-enable it.
+                    .keep_alive = head.keep_alive and head.version == .@"HTTP/1.1",
                     .suppress_body = head.method == .HEAD,
                 };
 
@@ -126,8 +135,13 @@ pub fn Http1Protocol(comptime App: type) type {
                 }
 
                 // Drain unread body so the next request parses cleanly; a
-                // body that fails to frame poisons the connection — close.
-                if (has_body) body.discard() catch return;
+                // body that fails to frame (or exceeds max_body_size) poisons
+                // the connection — flush the response already produced (e.g. a
+                // 413) so it still reaches the client, then close.
+                if (has_body) body.discard() catch {
+                    w.flush() catch {};
+                    return;
+                };
 
                 if (!head.keep_alive or !res.keep_alive or conn.isShuttingDown()) {
                     w.flush() catch {};
@@ -136,42 +150,6 @@ pub fn Http1Protocol(comptime App: type) type {
             }
         }
     };
-}
-
-const HeadEndError = error{
-    /// Peer closed before sending anything: normal keep-alive end.
-    CleanClose,
-    HeadersTooLarge,
-    TruncatedHead,
-    ReadFailed,
-};
-
-/// Scans the buffered window for the end-of-head terminator, refilling as
-/// needed. Returns the head length INCLUDING the final "\r\n\r\n".
-///
-/// `pending` (the connection writer, nullable for tests) is flushed before
-/// any blocking refill: the peer may be waiting for those responses before
-/// it sends the rest of this head — never park on read with queued output.
-fn findHeadEnd(r: *std.Io.Reader, pending: ?*std.Io.Writer, max_header_size: u32) HeadEndError!usize {
-    var search_start: usize = 0;
-    while (true) {
-        const window = r.buffered();
-        if (std.mem.indexOfPos(u8, window, search_start, "\r\n\r\n")) |idx| {
-            const head_len = idx + 4;
-            if (head_len > max_header_size) return error.HeadersTooLarge;
-            return head_len;
-        }
-        if (window.len > max_header_size) return error.HeadersTooLarge;
-        search_start = window.len -| 3;
-        if (pending) |w| w.flush() catch return error.ReadFailed;
-        r.fillMore() catch |err| switch (err) {
-            error.EndOfStream => {
-                if (r.bufferedLen() == 0) return error.CleanClose;
-                return error.TruncatedHead;
-            },
-            error.ReadFailed => return error.ReadFailed,
-        };
-    }
 }
 
 fn statusForParseError(err: parser.ParseError) Status {
@@ -200,25 +178,4 @@ fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Stat
     }) catch return;
     w.writeAll(phrase) catch return;
     w.flush() catch return;
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────
-
-test "findHeadEnd: locates terminator across refills" {
-    var r: std.Io.Reader = .fixed("GET / HTTP/1.1\r\nHost: h\r\n\r\nBODY");
-    const len = try findHeadEnd(&r, null, 1024);
-    try std.testing.expectEqual(27, len);
-    try std.testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: h\r\n\r\n", r.buffered()[0..len]);
-}
-
-test "findHeadEnd: oversized head rejected, clean close detected" {
-    const big = [_]u8{'a'} ** 128;
-    var r: std.Io.Reader = .fixed(&big);
-    try std.testing.expectError(error.HeadersTooLarge, findHeadEnd(&r, null, 64));
-
-    var r2: std.Io.Reader = .fixed("");
-    try std.testing.expectError(error.CleanClose, findHeadEnd(&r2, null, 64));
-
-    var r3: std.Io.Reader = .fixed("GET / HT");
-    try std.testing.expectError(error.TruncatedHead, findHeadEnd(&r3, null, 64));
 }

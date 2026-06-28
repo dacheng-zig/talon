@@ -1,8 +1,8 @@
-//! Response type (§2 public contract item 2).
+//! Response type.
 
 const std = @import("std");
-const parser = @import("parser.zig");
-const encode = @import("encode.zig");
+const parser = @import("codec/request_parser.zig");
+const encode = @import("codec/response_encode.zig");
 
 pub const Response = struct {
     out: *std.Io.Writer,

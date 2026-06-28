@@ -19,14 +19,15 @@ const log = std.log.scoped(.talon);
 
 /// The critical sections are O(1) with no suspension points, so a spin lock
 /// is cheaper than a coroutine mutex and keeps the pool runtime-agnostic.
-const SpinLock = struct {
+/// Shared with the client connection pool, which has the same discipline.
+pub const SpinLock = struct {
     state: std.atomic.Mutex = .unlocked,
 
-    fn lock(self: *SpinLock) void {
+    pub fn lock(self: *SpinLock) void {
         while (!self.state.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn unlock(self: *SpinLock) void {
+    pub fn unlock(self: *SpinLock) void {
         self.state.unlock();
     }
 };

@@ -1,4 +1,4 @@
-//! HTTP/1.1 head parser (design doc §5.5).
+//! HTTP/1.1 head parser.
 //!
 //! Pure function: bytes in, struct out. No allocation, no I/O — all returned
 //! slices borrow the input buffer. Single pass (picohttpparser approach)
@@ -16,32 +16,14 @@
 //!   - HTTP/1.1 requires exactly one Host header
 
 const std = @import("std");
+const codec = @import("codec.zig");
 
-pub const max_headers = 64;
-
-pub const Method = enum {
-    GET,
-    HEAD,
-    POST,
-    PUT,
-    DELETE,
-    CONNECT,
-    OPTIONS,
-    TRACE,
-    PATCH,
-    /// Any other token method; see Head.method_raw.
-    other,
-};
-
-pub const Version = enum {
-    @"HTTP/1.0",
-    @"HTTP/1.1",
-};
-
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+// Direction-neutral wire vocabulary is defined at the codec contract boundary
+// (codec.zig); re-exported here so the request side can use the bare names.
+pub const max_headers = codec.max_headers;
+pub const Method = codec.Method;
+pub const Version = codec.Version;
+pub const Header = codec.Header;
 
 pub const Head = struct {
     method: Method,
@@ -108,7 +90,7 @@ const targetchar_table = blk: {
     break :blk t;
 };
 
-fn isToken(bytes: []const u8) bool {
+pub fn isToken(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     for (bytes) |c| {
         if (!tchar_table[c]) return false;
@@ -121,6 +103,32 @@ fn validCharset(bytes: []const u8, comptime table: *const [256]bool) bool {
         if (!table[c]) return false;
     }
     return true;
+}
+
+/// field-content validation (VCHAR + obs-text + SP/HTAB). Shared with the
+/// response parser so both directions enforce the same field-value charset.
+pub fn validFieldValue(bytes: []const u8) bool {
+    return validCharset(bytes, &fieldchar_table);
+}
+
+/// request-target validation (VCHAR + obs-text, no SP/HTAB/CTL). Shared with
+/// the request encoder so the outbound side rejects the same injection
+/// vectors the inbound side does (no CRLF, no SP that would split the line).
+pub fn validTarget(bytes: []const u8) bool {
+    return bytes.len != 0 and validCharset(bytes, &targetchar_table);
+}
+
+/// Framing headers the encoders emit from their typed options
+/// (Content-Length / Transfer-Encoding / Connection). A caller-supplied
+/// duplicate riding `extra_headers` is a request-smuggling / response-splitting
+/// vector — a second Content-Length, or a CL+TE pairing — so both encoders
+/// reject it, staying symmetric with the parser's `ConflictingFraming` defense
+/// (CWE-113). Host (request) and Date (response) are framework-managed too, but
+/// each encoder checks those itself since the set is direction-specific.
+pub fn isReservedFramingHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "connection");
 }
 
 /// Parses a complete request head: everything from the request line up to
@@ -220,13 +228,13 @@ pub fn parse(bytes: []const u8, headers_storage: []Header) ParseError!Head {
     return head;
 }
 
-const LineIterator = struct {
+pub const LineIterator = struct {
     bytes: []const u8,
     pos: usize = 0,
 
     /// Next CRLF-terminated line (CRLF stripped). Errors on bare LF;
     /// null when input is exhausted.
-    fn next(self: *LineIterator) error{BareLineFeed}!?[]const u8 {
+    pub fn next(self: *LineIterator) error{BareLineFeed}!?[]const u8 {
         if (self.pos >= self.bytes.len) return null;
         const nl = std.mem.indexOfScalarPos(u8, self.bytes, self.pos, '\n') orelse
             return null; // unterminated tail: callers treat as malformed
@@ -236,7 +244,7 @@ const LineIterator = struct {
         return line;
     }
 
-    fn rest(self: *const LineIterator) []const u8 {
+    pub fn rest(self: *const LineIterator) []const u8 {
         return self.bytes[self.pos..];
     }
 };
@@ -288,7 +296,7 @@ fn methodFromToken(token: []const u8) Method {
 
 /// Strict Content-Length: ASCII digits only — no sign, no whitespace, no
 /// hex. Overflow is rejected.
-fn parseContentLength(value: []const u8) error{Invalid}!u64 {
+pub fn parseContentLength(value: []const u8) error{Invalid}!u64 {
     if (value.len == 0 or value.len > 19) return error.Invalid;
     var result: u64 = 0;
     for (value) |c| {
