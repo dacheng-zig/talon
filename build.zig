@@ -54,6 +54,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "https_get", .src = "examples/https_get.zig" },
         .{ .name = "http_client_bench", .src = "examples/http_client_bench.zig" },
         .{ .name = "resp", .src = "examples/resp.zig" },
+        .{ .name = "sse", .src = "examples/sse.zig" },
+        .{ .name = "ws", .src = "examples/ws.zig" },
     };
     for (examples) |ex| {
         const exe = b.addExecutable(.{

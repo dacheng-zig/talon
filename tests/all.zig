@@ -11,5 +11,10 @@ test {
     _ = @import("response_parser_fuzz_test.zig");
     _ = @import("body_test.zig");
     _ = @import("body_fuzz_test.zig");
+    _ = @import("sse_fuzz_test.zig");
+    _ = @import("sse_test.zig");
+    _ = @import("upgrade_test.zig");
+    _ = @import("ws_test.zig");
+    _ = @import("ws_fuzz_test.zig");
     _ = @import("listener_test.zig");
 }

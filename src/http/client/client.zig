@@ -548,6 +548,10 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// Keep the connection alive for pooling (default). Set false to
             /// send `connection: close`; that response is then never pooled.
             keep_alive: bool = true,
+            /// Per-request timeout override (null = the Client's defaults). A
+            /// long-poll or SSE stream relaxes `read`/`total` here without
+            /// loosening the shared Client's timeouts for ordinary requests.
+            timeouts: ?Timeouts = null,
         };
 
         pub fn init(gpa: std.mem.Allocator, connector: Connector, options: Options) Self {
@@ -661,7 +665,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // and shared across every redirect hop and retry — so `total` bounds
             // the entire call, not each hop independently (else N redirects could
             // each consume the full budget).
-            const deadline = totalDeadline(self.timeouts.total);
+            const deadline = totalDeadline((spec.timeouts orelse self.timeouts).total);
             var cur = spec;
             var redirects: u8 = 0;
             // Owns strings derived from each hop's Location (host+target); freed
@@ -721,9 +725,10 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // attempt, so even an idempotent PUT with a stream body must not
             // retry (it would send an empty/short body the second time).
             const retryable = isIdempotent(spec.method) and spec.body.replayable();
+            const timeouts = spec.timeouts orelse self.timeouts;
             var attempt: u8 = 0;
             while (true) {
-                const co = try self.pool.checkout(spec.origin, cap(self.timeouts.connect, deadline));
+                const co = try self.pool.checkout(spec.origin, cap(timeouts.connect, deadline));
                 // Set true by roundtrip once the first response byte arrives.
                 // Past that point the server may have acted on the request, so
                 // the failure must not be replayed even on an idempotent method.
@@ -755,6 +760,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// One attempt over an already-checked-out connection. On any error the
         /// connection is left for the caller to close (no checkin here).
         fn roundtrip(self: *Self, conn: *Conn, spec: RequestSpec, deadline: ?zio.Timestamp, received_response: *bool) !Response {
+            const timeouts = spec.timeouts orelse self.timeouts;
             // Host header: omit the port when it is the scheme default.
             var host_buf: [320]u8 = undefined;
             const host_val = if (spec.origin.port == Origin.defaultPort(spec.origin.scheme))
@@ -771,7 +777,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .chunked => .{ null, true },
             };
 
-            conn.setWriteTimeout(cap(self.timeouts.write, deadline));
+            conn.setWriteTimeout(cap(timeouts.write, deadline));
             try conn.sendRequest(.{
                 .method = spec.method,
                 .target = spec.target,
@@ -793,7 +799,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // The read deadline stays set so the lazily streamed body inherits it
             // — and, being capped to the total deadline, the body read is bounded
             // by the whole-request budget too.
-            conn.setReadTimeout(cap(self.timeouts.read, deadline));
+            conn.setReadTimeout(cap(timeouts.read, deadline));
             // Wait for the first response byte before committing to the parse.
             // A failure here (or above, in the write) means no response was
             // received, so an idempotent request was not processed and may be
@@ -875,6 +881,169 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
 
         pub fn postUrl(self: *Self, url: []const u8, body: []const u8) !Response {
             return self.requestUrl(.{ .method = .POST, .url = url, .body = .{ .bytes = body } });
+        }
+
+        // ── Server-Sent Events source ──────────────────────────────────────
+
+        pub const ReconnectConfig = struct {
+            /// null = reconnect forever; otherwise stop after this many
+            /// consecutive failed/ended connections with no event in between.
+            max_retries: ?u32 = null,
+            /// Backoff bounds. The server's `retry:` value overrides these when
+            /// present; otherwise the delay grows from initial to max.
+            initial_delay_ms: u64 = 1000,
+            max_delay_ms: u64 = 30_000,
+        };
+
+        pub const SseSpec = struct {
+            method: Method = .GET,
+            origin: Origin,
+            target: []const u8 = "/",
+            extra_headers: []const Header = &.{},
+            body: Body = .none,
+            /// Per-event working buffer (largest event to accept).
+            scratch_size: usize = 16 * 1024,
+            reconnect: ReconnectConfig = .{},
+        };
+
+        /// A reconnecting Server-Sent Events stream. `next()` yields events and
+        /// transparently reconnects on drop — carrying `Last-Event-ID` and
+        /// honoring the server's `retry:` delay — until the retry budget runs
+        /// out or the server ends the stream with 204. Read timeouts are
+        /// disabled (a silent stream must not be killed); liveness comes from
+        /// server heartbeats. Events borrow an internal buffer, valid until the
+        /// next `next()` call.
+        pub const SseSource = struct {
+            client: *Self,
+            spec: SseSpec,
+            scratch: []u8,
+            last_id: ?[]u8 = null,
+            resp: ?Response = null,
+            decoder: codec.sse.EventDecoder = undefined,
+            server_retry_ms: ?u32 = null,
+            retries: u32 = 0,
+            delay_ms: u64,
+            stopped: bool = false,
+
+            pub fn deinit(self: *SseSource) void {
+                self.closeCurrent();
+                if (self.last_id) |id| self.client.gpa.free(id);
+                self.client.gpa.free(self.scratch);
+            }
+
+            /// Next event, or null when the stream ends (204 or exhausted
+            /// retries). Errors surface a connect failure with no retries left.
+            pub fn next(self: *SseSource) !?codec.sse.Event {
+                while (true) {
+                    if (self.stopped) return null;
+                    if (self.resp == null) {
+                        self.connect() catch |err| {
+                            if (!self.canRetry()) return err;
+                            try self.backoff();
+                            continue;
+                        };
+                        if (self.stopped) return null; // 204
+                    }
+                    const ev = self.decoder.next() catch {
+                        self.endConnection();
+                        if (!self.canRetry()) return null;
+                        try self.backoff();
+                        continue;
+                    };
+                    if (ev) |e| {
+                        self.retries = 0;
+                        self.delay_ms = self.spec.reconnect.initial_delay_ms;
+                        if (e.id) |id| try self.setLastId(id);
+                        return e;
+                    }
+                    // Clean EOF: the server closed the stream — reconnect.
+                    self.endConnection();
+                    if (!self.canRetry()) return null;
+                    try self.backoff();
+                }
+            }
+
+            fn connect(self: *SseSource) !void {
+                // Last-Event-ID resumes the stream where it dropped.
+                var buf: [16]Header = undefined;
+                var headers: []const Header = self.spec.extra_headers;
+                if (self.last_id) |id| {
+                    if (self.spec.extra_headers.len + 1 > buf.len) return error.TooManyHeaders;
+                    @memcpy(buf[0..self.spec.extra_headers.len], self.spec.extra_headers);
+                    buf[self.spec.extra_headers.len] = .{ .name = "last-event-id", .value = id };
+                    headers = buf[0 .. self.spec.extra_headers.len + 1];
+                }
+
+                const resp = try self.client.request(.{
+                    .method = self.spec.method,
+                    .origin = self.spec.origin,
+                    .target = self.spec.target,
+                    .extra_headers = headers,
+                    .body = self.spec.body,
+                    // A silent stream must survive: no read/total deadline.
+                    .timeouts = .{ .read = .none, .total = .none },
+                });
+
+                const st = resp.status();
+                if (st == 204) {
+                    resp.pool.checkin(resp.conn, false);
+                    self.stopped = true;
+                    return;
+                }
+                if (st != 200) {
+                    resp.pool.checkin(resp.conn, false);
+                    return error.SseUnexpectedStatus;
+                }
+                self.resp = resp;
+                self.decoder = codec.sse.EventDecoder.init(self.resp.?.bodyReader(), self.scratch);
+                if (self.last_id) |id| self.decoder.last_id = id;
+            }
+
+            // Force-closes the live connection without draining — an SSE body is
+            // effectively infinite, so the pool must destroy it, not reuse it.
+            fn endConnection(self: *SseSource) void {
+                self.server_retry_ms = self.decoder.reconnect_ms;
+                self.closeCurrent();
+            }
+
+            fn closeCurrent(self: *SseSource) void {
+                if (self.resp) |resp| {
+                    resp.pool.checkin(resp.conn, false);
+                    self.resp = null;
+                }
+            }
+
+            fn setLastId(self: *SseSource, id: []const u8) !void {
+                const dup = try self.client.gpa.dupe(u8, id);
+                if (self.last_id) |old| self.client.gpa.free(old);
+                self.last_id = dup;
+            }
+
+            fn canRetry(self: *const SseSource) bool {
+                const max = self.spec.reconnect.max_retries orelse return true;
+                return self.retries < max;
+            }
+
+            fn backoff(self: *SseSource) !void {
+                self.retries += 1;
+                // The server's retry: directive wins; otherwise exponential
+                // growth bounded by max_delay.
+                const ms = self.server_retry_ms orelse self.delay_ms;
+                zio.sleep(.fromMilliseconds(ms)) catch return error.Canceled;
+                self.delay_ms = @min(self.delay_ms * 2, self.spec.reconnect.max_delay_ms);
+            }
+        };
+
+        /// Opens a reconnecting SSE stream. Caller drives it with `next()` and
+        /// releases it with `deinit()`.
+        pub fn sseSource(self: *Self, spec: SseSpec) !SseSource {
+            const scratch = try self.gpa.alloc(u8, spec.scratch_size);
+            return .{
+                .client = self,
+                .spec = spec,
+                .scratch = scratch,
+                .delay_ms = spec.reconnect.initial_delay_ms,
+            };
         }
     };
 }

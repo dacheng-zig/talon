@@ -4,9 +4,11 @@
 //! vectored write path — std.http fully replaced. Public contract:
 //! `Server(App)` with `App.handle(req: *Request, res: *Response)`.
 //!
-//! The HTTP wire codec is carved into `talon.http.codec` (request/response
-//! parse + encode + body), consumed by both this server layer and the
-//! `talon.http.client`. The shared, direction-neutral
+//! Layout mirrors the two directions: `server/` (inbound: Http1Protocol,
+//! Request/Response, SSE, WebSocket) and `client/` (outbound), over a shared
+//! `codec/`. The HTTP wire codec is carved into `talon.http.codec`
+//! (request/response parse + encode + body), consumed by both directions.
+//! The shared, direction-neutral
 //! vocabulary (Method/Version/Header/Status) is surfaced at this package root
 //! for ergonomics — `talon.http.Method` etc. — while its canonical home stays
 //! in the codec (defined in `codec/codec.zig`, the contract boundary);
@@ -26,10 +28,19 @@ pub const codec = @import("codec/codec.zig");
 /// Outbound HTTP/1.1 client: Connector + ClientConnection + Client.
 pub const client = @import("client/client.zig");
 
+/// Inbound HTTP/1.1 server: Http1Protocol + Request/Response + SSE/WebSocket.
+const server = @import("server/server.zig");
+
 /// Server-side request/response types and protocol.
-pub const Http1Protocol = @import("protocol.zig").Http1Protocol;
-pub const Request = @import("request.zig").Request;
-pub const Response = @import("response.zig").Response;
+pub const Http1Protocol = server.Http1Protocol;
+pub const Request = server.Request;
+pub const Response = server.Response;
+
+/// Server-side Server-Sent Events stream (opened via `Response.startEventStream`).
+pub const EventStream = server.EventStream;
+
+/// Server-side WebSocket: `ws.upgrade(req, .{})` → message read/write loop.
+pub const ws = server.ws;
 
 /// Shared HTTP vocabulary, surfaced at the package root so callers can write
 /// `talon.http.Method` etc. Canonical definitions live in `codec/codec.zig`;
@@ -54,7 +65,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = codec;
     _ = client;
-    _ = @import("protocol.zig");
-    _ = @import("request.zig");
-    _ = @import("response.zig");
+    _ = server;
 }

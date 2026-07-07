@@ -41,12 +41,6 @@ fn fetchAll(gpa: std.mem.Allocator, urls: []const []const u8) !void {
         ),
         else => std.log.err("{s}: {s}", .{ url, @errorName(err) }),
     };
-
-    // Surfaces connection reuse: created < total requests means the pool worked.
-    const stats = c.poolStats();
-    std.log.info("pool: created={d} reused={d} evicted={d}", .{
-        stats.created, stats.reused, stats.evicted,
-    });
 }
 
 fn fetchOne(gpa: std.mem.Allocator, c: *client.Client(client.TcpConnector), url: []const u8) !void {

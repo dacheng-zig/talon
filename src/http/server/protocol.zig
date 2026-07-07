@@ -13,14 +13,16 @@
 //! correctness without giving up the zero-copy parse.
 
 const std = @import("std");
-const parser = @import("codec/request_parser.zig");
-const body_mod = @import("codec/body.zig");
-const encode = @import("codec/response_encode.zig");
-const head_scan = @import("codec/head.zig");
+const zio = @import("zio");
+const parser = @import("../codec/request_parser.zig");
+const body_mod = @import("../codec/body.zig");
+const encode = @import("../codec/response_encode.zig");
+const head_scan = @import("../codec/head.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
 
 pub const Request = request_mod.Request;
+pub const Upgrade = request_mod.Upgrade;
 pub const Response = response_mod.Response;
 pub const Status = encode.Status;
 
@@ -47,6 +49,24 @@ pub fn Http1Protocol(comptime App: type) type {
             // vtable (and get a clean EndOfStream) instead of spinning on a
             // zero-capacity buffer.
             var empty_body_buffer: [1]u8 = undefined;
+
+            // Connection-upgrade handle, reused across requests. The reader and
+            // writer are already type-erased; only setReadTimeout is
+            // transport-specific, reached through a thunk over `conn`.
+            var upgrade_taken = false;
+            const UpgradeThunk = struct {
+                fn setReadTimeout(ctx: *anyopaque, timeout: zio.Timeout) void {
+                    const c: @TypeOf(conn) = @ptrCast(@alignCast(ctx));
+                    c.setReadTimeout(timeout);
+                }
+            };
+            var upgrade_ctx: Upgrade = .{
+                .reader = r,
+                .writer = w,
+                .taken = &upgrade_taken,
+                .ctx = conn,
+                .set_read_timeout_fn = UpgradeThunk.setReadTimeout,
+            };
 
             while (true) {
                 // Ship pending responses only when the read side is about
@@ -104,7 +124,7 @@ pub fn Http1Protocol(comptime App: type) type {
                     w.flush() catch return;
                 }
 
-                var req: Request = .{ .head = head, .arena = arena, .body = &body };
+                var req: Request = .{ .head = head, .arena = arena, .body = &body, .upgrade = &upgrade_ctx };
                 var res: Response = .{
                     .out = w,
                     .date = &date_cache,
@@ -128,6 +148,11 @@ pub fn Http1Protocol(comptime App: type) type {
                     }
                     return err; // surface handler errors to the server log
                 };
+
+                // The handler upgraded the connection (e.g. WebSocket) and drove
+                // it to completion; it is no longer an HTTP connection, so leave
+                // the loop instead of reading another request.
+                if (upgrade_taken) return;
 
                 if (!res.written) {
                     // Handler contract violation: never leave the client hanging.

@@ -41,11 +41,6 @@ fn fetchAll(gpa: std.mem.Allocator, io: std.Io, urls: []const []const u8) !void 
 
     for (urls) |url| fetchOne(gpa, &c, url) catch |err|
         std.log.err("{s}: {s}", .{ url, @errorName(err) });
-
-    const stats = c.poolStats();
-    std.log.info("pool: created={d} reused={d} evicted={d}", .{
-        stats.created, stats.reused, stats.evicted,
-    });
 }
 
 fn fetchOne(gpa: std.mem.Allocator, c: *client.TlsClient, url: []const u8) !void {

@@ -104,6 +104,30 @@ pub fn writeHead(w: *std.Io.Writer, date: *DateCache, options: HeadOptions) (std
     try w.writeAll("\r\n");
 }
 
+pub const UpgradeOptions = struct {
+    /// Upgrade-header protocol token, e.g. "websocket".
+    protocol: []const u8,
+    /// Protocol-specific headers (e.g. sec-websocket-accept). Validated for
+    /// injection; the framework owns the upgrade/connection lines.
+    extra_headers: []const parser.Header = &.{},
+};
+
+/// Writes a `101 Switching Protocols` head. The `upgrade`/`connection` lines
+/// are framework-generated (so they bypass the reserved-framing rejection that
+/// `writeHead` applies to app headers), while caller `extra_headers` are still
+/// validated for CR/LF injection and may not smuggle framing headers.
+pub fn writeUpgrade(w: *std.Io.Writer, options: UpgradeOptions) (std.Io.Writer.Error || EncodeError)!void {
+    if (!parser.isToken(options.protocol)) return error.InvalidHeader;
+    for (options.extra_headers) |h| {
+        if (!parser.isToken(h.name) or !parser.validFieldValue(h.value)) return error.InvalidHeader;
+        if (parser.isReservedFramingHeader(h.name)) return error.InvalidHeader;
+    }
+    try w.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
+    try w.print("upgrade: {s}\r\nconnection: upgrade\r\n", .{options.protocol});
+    for (options.extra_headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+    try w.writeAll("\r\n");
+}
+
 /// Streaming chunked body writer: every drain emits one chunk
 /// (`<hex>\r\n<payload>\r\n`); `finish()` emits the last-chunk terminator.
 pub const ChunkedBodyWriter = struct {

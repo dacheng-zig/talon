@@ -1,8 +1,9 @@
 //! Response type.
 
 const std = @import("std");
-const parser = @import("codec/request_parser.zig");
-const encode = @import("codec/response_encode.zig");
+const parser = @import("../codec/request_parser.zig");
+const encode = @import("../codec/response_encode.zig");
+const event_stream = @import("event_stream.zig");
 
 pub const Response = struct {
     out: *std.Io.Writer,
@@ -55,5 +56,14 @@ pub const Response = struct {
             .keep_alive = self.keep_alive,
         });
         return encode.ChunkedBodyWriter.init(self.out, buffer);
+    }
+
+    /// Opens a Server-Sent Events stream: a chunked response carrying the SSE
+    /// default headers. Write events through the returned `EventStream`; keep
+    /// it at a stable address (the chunked writer resolves its parent by
+    /// pointer). `buffer` (from `req.arena`) sizes the per-event staging.
+    pub fn startEventStream(self: *Response, buffer: []u8) !event_stream.EventStream {
+        const cw = try self.startChunked(.{ .extra_headers = &event_stream.default_headers }, buffer);
+        return .{ .chunked = cw };
     }
 };

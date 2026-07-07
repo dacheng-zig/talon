@@ -21,6 +21,12 @@ pub const response_encode = @import("response_encode.zig");
 const body = @import("body.zig");
 const head = @import("head.zig");
 
+/// Server-Sent Events wire codec (serialize + incremental decode).
+pub const sse = @import("sse.zig");
+
+/// WebSocket (RFC 6455) frame codec + handshake.
+pub const ws = @import("ws.zig");
+
 pub const BodyReader = body.BodyReader;
 pub const BodyError = body.BodyError;
 pub const ChunkedBodyWriter = response_encode.ChunkedBodyWriter;
@@ -69,4 +75,6 @@ test {
     _ = response_encode;
     _ = body;
     _ = head;
+    _ = sse;
+    _ = ws;
 }
