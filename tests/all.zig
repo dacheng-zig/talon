@@ -15,6 +15,7 @@ test {
     _ = @import("sse_test.zig");
     _ = @import("upgrade_test.zig");
     _ = @import("ws_test.zig");
+    _ = @import("ws_client_test.zig");
     _ = @import("ws_fuzz_test.zig");
     _ = @import("listener_test.zig");
 }

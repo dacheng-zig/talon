@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "resp", .src = "examples/resp.zig" },
         .{ .name = "sse", .src = "examples/sse.zig" },
         .{ .name = "ws", .src = "examples/ws.zig" },
+        .{ .name = "ws_client", .src = "examples/ws_client.zig" },
     };
     for (examples) |ex| {
         const exe = b.addExecutable(.{

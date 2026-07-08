@@ -455,8 +455,9 @@ fn flateContainerFor(content_encoding: []const u8) ?flate.Container {
 /// RFC 9110 §15.2 / RFC 9112: a client MUST be able to parse one or more 1xx
 /// responses (e.g. 100 Continue, 103 Early Hints) that precede the final
 /// response; they carry no body. 101 (Switching Protocols) is returned as the
-/// final head — this client never requests an upgrade, so a 101 cannot
-/// legitimately arrive, and returning it avoids blocking on a phantom next head.
+/// final head — the WebSocket client (`client.webSocket`) requests an upgrade
+/// and hijacks the connection off this head; returning it (rather than looping
+/// for a phantom next head) is what makes that possible.
 fn readFinalHead(
     r: *std.Io.Reader,
     arena: std.mem.Allocator,

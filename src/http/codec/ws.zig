@@ -7,6 +7,7 @@
 //! into its own buffer and `unmask`s in place.
 
 const std = @import("std");
+const zio = @import("zio");
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -172,6 +173,212 @@ pub fn writeFrame(
     try w.writeAll(payload);
 }
 
+// ── Message session (direction-neutral loop) ────────────────────────────────
+
+/// Wire side of a session. Selects two things at comptime: which mask bit an
+/// inbound frame must carry (RFC 6455 §5.1 — client→server frames are masked,
+/// server→client frames are not), and whether outbound frames are masked.
+pub const Role = enum { server, client };
+
+pub const Message = union(enum) {
+    text: []const u8,
+    binary: []const u8,
+};
+
+pub const ReadError = error{
+    ProtocolError,
+    MessageTooLarge,
+} || std.Io.Reader.Error || std.Io.Writer.Error;
+
+/// A masking key from a strong entropy source (RFC 6455 §5.3): each client
+/// frame carries a fresh unpredictable key, closing the cache-poisoning vector
+/// that predictable masking would open.
+fn randomMaskKey() [4]u8 {
+    var key: [4]u8 = undefined;
+    // The per-executor CSPRNG: unpredictable (defeats proxy cache poisoning)
+    // and syscall-free on the hot send path.
+    zio.random(&key);
+    return key;
+}
+
+/// The message-assembly loop shared by the server and client WebSocket ends:
+/// reassembles fragments, answers ping with pong, echoes close, and validates
+/// UTF-8 on text — a straight-line `while (try read()) |msg|`. `role` fixes the
+/// masking direction (see `Role`); everything else is identical on both ends,
+/// so this is the single sans-io core both build on.
+pub fn Session(comptime role: Role) type {
+    return struct {
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        /// Reassembly buffer sized to the largest accepted message; a bigger
+        /// message closes with 1009.
+        msg_buf: []u8,
+        close_sent: bool = false,
+
+        const Self = @This();
+
+        /// Outbound mask: a fresh random key on the client, none on the server.
+        fn outboundMask() ?[4]u8 {
+            return if (role == .client) randomMaskKey() else null;
+        }
+
+        /// Next message, or null when the peer closed (a close is echoed) or the
+        /// connection ended. Fragments are reassembled; ping is answered with
+        /// pong; unsolicited pong is ignored. Control frames never surface.
+        pub fn read(self: *Self) ReadError!?Message {
+            var assembled: usize = 0;
+            var msg_opcode: ?Opcode = null;
+            while (true) {
+                const h = readFrameHeader(self.reader) catch |err| switch (err) {
+                    error.EndOfStream => return null, // peer vanished without close
+                    error.ProtocolError => return self.fail(.protocol_error),
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                // Masking is directional: a client→server frame MUST be masked,
+                // a server→client frame MUST NOT be (RFC 6455 §5.1).
+                const inbound_ok = switch (role) {
+                    .server => h.masked,
+                    .client => !h.masked,
+                };
+                if (!inbound_ok) return self.fail(.protocol_error);
+                const len: usize = @intCast(h.payload_len);
+
+                if (h.opcode.isControl()) {
+                    var ctl: [max_control_payload]u8 = undefined;
+                    try self.reader.readSliceAll(ctl[0..len]);
+                    if (h.masked) unmask(ctl[0..len], h.mask_key);
+                    switch (h.opcode) {
+                        .ping => try self.writeControl(.pong, ctl[0..len]),
+                        .pong => {}, // unsolicited pong: ignore
+                        .close => switch (closeValidity(ctl[0..len])) {
+                            .ok => {
+                                try self.echoClose();
+                                return null;
+                            },
+                            .bad_code => return self.fail(.protocol_error),
+                            .bad_reason => return self.fail(.invalid_payload),
+                        },
+                        else => unreachable,
+                    }
+                    continue;
+                }
+
+                // Data frame: enforce fragmentation ordering.
+                if (h.opcode == .continuation) {
+                    if (msg_opcode == null) return self.fail(.protocol_error);
+                } else {
+                    if (msg_opcode != null) return self.fail(.protocol_error);
+                    msg_opcode = h.opcode;
+                }
+
+                // Subtraction keeps the bound overflow-safe: a crafted 64-bit
+                // frame length would wrap `assembled + len`. assembled never
+                // exceeds the buffer, so the right-hand side never underflows.
+                if (len > self.msg_buf.len - assembled) return self.fail(.message_too_big);
+                try self.reader.readSliceAll(self.msg_buf[assembled..][0..len]);
+                if (h.masked) unmask(self.msg_buf[assembled..][0..len], h.mask_key);
+                assembled += len;
+
+                if (h.fin) {
+                    const msg = self.msg_buf[0..assembled];
+                    switch (msg_opcode.?) {
+                        // A text message must be valid UTF-8; reject it with 1007
+                        // rather than forward bytes the peer promised were text.
+                        .text => {
+                            if (!std.unicode.utf8ValidateSlice(msg)) return self.fail(.invalid_payload);
+                            return .{ .text = msg };
+                        },
+                        .binary => return .{ .binary = msg },
+                        else => unreachable,
+                    }
+                }
+            }
+        }
+
+        pub fn writeText(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+            try self.writeMessage(.text, data);
+        }
+
+        pub fn writeBinary(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+            try self.writeMessage(.binary, data);
+        }
+
+        fn writeMessage(self: *Self, opcode: Opcode, data: []const u8) std.Io.Writer.Error!void {
+            try writeFrame(self.writer, opcode, true, data, outboundMask());
+            try self.writer.flush();
+        }
+
+        /// Sends a ping. `data` must be at most 125 bytes (the control-frame limit).
+        pub fn writePing(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+            try self.writeControl(.ping, data);
+        }
+
+        fn writeControl(self: *Self, opcode: Opcode, data: []const u8) std.Io.Writer.Error!void {
+            std.debug.assert(data.len <= max_control_payload);
+            try writeFrame(self.writer, opcode, true, data, outboundMask());
+            try self.writer.flush();
+        }
+
+        /// Sends a close frame (idempotent). The caller then stops reading.
+        pub fn close(self: *Self, code: CloseCode, reason: []const u8) std.Io.Writer.Error!void {
+            if (self.close_sent) return;
+            var buf: [2 + 123]u8 = undefined;
+            std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
+            const rlen = @min(reason.len, buf.len - 2);
+            @memcpy(buf[2..][0..rlen], reason[0..rlen]);
+            try writeFrame(self.writer, .close, true, buf[0 .. 2 + rlen], outboundMask());
+            try self.writer.flush();
+            self.close_sent = true;
+        }
+
+        fn echoClose(self: *Self) std.Io.Writer.Error!void {
+            try self.close(.normal, "");
+        }
+
+        // Sends a close with `code` and reports the matching error to the caller.
+        fn fail(self: *Self, code: CloseCode) ReadError {
+            self.close(code, "") catch {};
+            return if (code == .message_too_big) error.MessageTooLarge else error.ProtocolError;
+        }
+    };
+}
+
+// ── Close-frame validation (direction-neutral) ──────────────────────────────
+
+pub const CloseValidity = enum { ok, bad_code, bad_reason };
+
+/// A received close frame is well-formed when it is empty, or carries a valid
+/// 2-byte close code followed by a UTF-8 reason. A lone byte cannot hold the
+/// 2-byte code, so it is malformed.
+pub fn closeValidity(payload: []const u8) CloseValidity {
+    if (payload.len == 0) return .ok;
+    if (payload.len == 1) return .bad_code;
+    const code: u16 = @as(u16, payload[0]) << 8 | payload[1];
+    if (!validCloseCode(code)) return .bad_code;
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) return .bad_reason;
+    return .ok;
+}
+
+// Close codes a peer may put on the wire: RFC 6455's application codes, the
+// later IANA additions (1012–1014), and the registered/private range
+// 3000–4999. Excludes 1004 (reserved) and 1005/1006/1015 (never transmitted).
+fn validCloseCode(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1014, 3000...4999 => true,
+        else => false,
+    };
+}
+
+/// Case-insensitive token membership in a comma-separated header value — the
+/// handshake check for `Upgrade`/`Connection` on both ends.
+pub fn headerHasToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -261,4 +468,53 @@ test "readFrameHeader: rejects RSV bits and oversized control frames" {
     // Binary frame whose 64-bit length has the top bit set is illegal.
     var r3: std.Io.Reader = .fixed(&[_]u8{ 0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0 });
     try testing.expectError(error.ProtocolError, readFrameHeader(&r3));
+}
+
+test "closeValidity: codes and reason" {
+    try testing.expectEqual(CloseValidity.ok, closeValidity("")); // no code
+    try testing.expectEqual(CloseValidity.ok, closeValidity(&[_]u8{ 0x03, 0xe8 })); // 1000
+    try testing.expectEqual(CloseValidity.bad_code, closeValidity(&[_]u8{0x03})); // 1 byte
+    try testing.expectEqual(CloseValidity.bad_code, closeValidity(&[_]u8{ 0x03, 0xec })); // 1004 reserved
+    try testing.expectEqual(CloseValidity.bad_code, closeValidity(&[_]u8{ 0x00, 0x00 })); // 0
+    try testing.expectEqual(CloseValidity.bad_reason, closeValidity(&[_]u8{ 0x03, 0xe8, 0xff })); // bad UTF-8
+}
+
+test "headerHasToken: case-insensitive, comma lists" {
+    try testing.expect(headerHasToken("websocket", "websocket"));
+    try testing.expect(headerHasToken("Upgrade, WebSocket", "websocket"));
+    try testing.expect(!headerHasToken("h2c", "websocket"));
+}
+
+test "Session(.client): masks outbound, decodes unmasked inbound" {
+    // Client writes a text message → framed with the mask bit set.
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    // Server sends an unmasked text frame "hi" the client must accept.
+    const inbound = [_]u8{ 0x81, 0x02, 'h', 'i' };
+    var r: std.Io.Reader = .fixed(&inbound);
+    var msg_buf: [16]u8 = undefined;
+    var sock: Session(.client) = .{ .reader = &r, .writer = &w, .msg_buf = &msg_buf };
+
+    const msg = (try sock.read()).?;
+    try testing.expectEqualStrings("hi", msg.text);
+
+    try sock.writeText("yo");
+    var rr: std.Io.Reader = .fixed(w.buffered());
+    const h = try readFrameHeader(&rr);
+    try testing.expect(h.masked); // client frames are always masked
+    var body: [2]u8 = undefined;
+    try rr.readSliceAll(&body);
+    unmask(&body, h.mask_key);
+    try testing.expectEqualStrings("yo", &body);
+}
+
+test "Session(.client): a masked server frame is a protocol error" {
+    // Server→client frame with the mask bit set is illegal (RFC 6455 §5.1).
+    const input = [_]u8{ 0x81, 0x82, 0, 0, 0, 0, 'a', 'b' };
+    var r: std.Io.Reader = .fixed(&input);
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var msg_buf: [16]u8 = undefined;
+    var sock: Session(.client) = .{ .reader = &r, .writer = &w, .msg_buf = &msg_buf };
+    try testing.expectError(error.ProtocolError, sock.read());
 }

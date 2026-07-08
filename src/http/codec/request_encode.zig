@@ -25,6 +25,12 @@ pub const HeadOptions = struct {
     chunked: bool = false,
     /// false → emit `connection: close`.
     keep_alive: bool = true,
+    /// Protocol-upgrade token (e.g. "websocket"). When set, the encoder emits
+    /// `upgrade: <token>` + `connection: upgrade` and suppresses the
+    /// keep-alive/close line — the request-side dual of `response_encode`'s
+    /// `writeUpgrade`. Protocol-specific headers (Sec-WebSocket-Key/Version/…)
+    /// ride `extra_headers`. null = an ordinary request.
+    upgrade: ?[]const u8 = null,
     /// Default request headers emitted (when non-null) after Host, before the
     /// framing headers. The client fills these with its policy defaults
     /// (User-Agent, Accept, Accept-Encoding) unless the caller overrode them
@@ -93,7 +99,13 @@ pub fn writeHead(w: *std.Io.Writer, options: HeadOptions) (std.Io.Writer.Error |
     } else if (options.chunked) {
         try w.writeAll("transfer-encoding: chunked\r\n");
     }
-    if (!options.keep_alive) {
+    if (options.upgrade) |proto| {
+        // The upgrade drives the connection semantics, so it overrides the
+        // keep-alive/close choice: an upgrade request must say `Connection:
+        // upgrade`, never `close`.
+        if (!rp.isToken(proto)) return error.InvalidRequestField;
+        try w.print("upgrade: {s}\r\nconnection: upgrade\r\n", .{proto});
+    } else if (!options.keep_alive) {
         try w.writeAll("connection: close\r\n");
     }
     for (options.extra_headers) |h| {
@@ -198,6 +210,28 @@ test "writeHead: emits policy default headers after host" {
     try std.testing.expectEqualStrings(
         "GET / HTTP/1.1\r\nhost: h\r\n" ++
             "user-agent: talon-http-client/1.0\r\naccept: */*\r\naccept-encoding: gzip, deflate\r\n\r\n",
+        w.buffered(),
+    );
+}
+
+test "writeHead: upgrade request emits upgrade+connection, no close line" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeHead(&w, .{
+        .host = "h",
+        .upgrade = "websocket",
+        // keep_alive=false must NOT produce `connection: close` here — the
+        // upgrade line wins.
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "sec-websocket-key", .value = "dGhlIHNhbXBsZSBub25jZQ==" },
+            .{ .name = "sec-websocket-version", .value = "13" },
+        },
+    });
+    try std.testing.expectEqualStrings(
+        "GET / HTTP/1.1\r\nhost: h\r\n" ++
+            "upgrade: websocket\r\nconnection: upgrade\r\n" ++
+            "sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n",
         w.buffered(),
     );
 }

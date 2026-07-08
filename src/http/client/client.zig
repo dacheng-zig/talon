@@ -552,6 +552,10 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// long-poll or SSE stream relaxes `read`/`total` here without
             /// loosening the shared Client's timeouts for ordinary requests.
             timeouts: ?Timeouts = null,
+            /// Protocol-upgrade token (e.g. "websocket"): emits `Connection:
+            /// upgrade` + `Upgrade: <token>` and expects a 101. Drives
+            /// `webSocket`; null = an ordinary request.
+            upgrade: ?[]const u8 = null,
         };
 
         pub fn init(gpa: std.mem.Allocator, connector: Connector, options: Options) Self {
@@ -786,6 +790,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .content_length = content_length,
                 .chunked = chunked,
                 .keep_alive = spec.keep_alive,
+                .upgrade = spec.upgrade,
                 // Policy defaults, suppressed per-header when the caller (or a
                 // middleware, already merged into extra_headers) set their own.
                 .user_agent = if (headerPresent(spec.extra_headers, "user-agent")) null else default_user_agent,
@@ -1043,6 +1048,153 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .spec = spec,
                 .scratch = scratch,
                 .delay_ms = spec.reconnect.initial_delay_ms,
+            };
+        }
+
+        // ── WebSocket client ────────────────────────────────────────────────
+
+        pub const WebSocketSpec = struct {
+            origin: Origin,
+            target: []const u8 = "/",
+            extra_headers: []const Header = &.{},
+            /// Subprotocol offered in `Sec-WebSocket-Protocol`. When set, the
+            /// server's confirmed choice must equal it, else the handshake fails.
+            subprotocol: ?[]const u8 = null,
+            /// Largest message (all fragments) to accept; a bigger inbound
+            /// message closes the connection with 1009.
+            max_message_size: usize = 64 * 1024,
+            /// Read deadline while awaiting frames. Default none: a silent
+            /// stream is not killed (liveness comes from ping/pong), the same
+            /// stance as `SseSource`. Set it to bound an idle read.
+            read_timeout: zio.Timeout = .none,
+        };
+
+        pub const WebSocketError = error{
+            /// The upgrade response was not a clean 101 with a matching
+            /// `Upgrade`/`Connection`/`Sec-WebSocket-Accept` (and, when offered,
+            /// `Sec-WebSocket-Protocol`).
+            HandshakeFailed,
+            /// The caller's headers plus the handshake headers exceeded the
+            /// fixed request-header buffer.
+            TooManyHeaders,
+        };
+
+        /// A live client-side WebSocket over a hijacked connection. Symmetric
+        /// with the server's `WebSocket`: `read()` returns whole messages
+        /// (fragments reassembled, ping answered with pong, close echoed);
+        /// writes are masked per RFC 6455. The connection is single-use — it is
+        /// destroyed (never pooled) on `deinit`. Not reconnecting: a drop
+        /// surfaces as `read()` returning null (peer close) or an error, and the
+        /// caller decides whether to dial again.
+        pub const WebSocketClient = struct {
+            client: *Self,
+            conn: *Conn,
+            session: codec.ws.Session(.client),
+            msg_buf: []u8,
+
+            pub const Message = codec.ws.Message;
+            pub const CloseCode = codec.ws.CloseCode;
+
+            /// Next message, or null when the peer closed (a close is echoed) or
+            /// the connection ended. Borrows an internal buffer valid until the
+            /// next `read`.
+            pub fn read(self: *WebSocketClient) codec.ws.ReadError!?Message {
+                return self.session.read();
+            }
+
+            pub fn writeText(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+                return self.session.writeText(data);
+            }
+
+            pub fn writeBinary(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+                return self.session.writeBinary(data);
+            }
+
+            /// Sends a ping (`data` ≤ 125 bytes).
+            pub fn writePing(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+                return self.session.writePing(data);
+            }
+
+            /// Sends a close frame (idempotent). The caller then stops reading.
+            pub fn close(self: *WebSocketClient, code: CloseCode, reason: []const u8) std.Io.Writer.Error!void {
+                return self.session.close(code, reason);
+            }
+
+            /// Best-effort close, then destroys the connection (a WebSocket
+            /// connection is never returned to the pool) and frees the buffer.
+            pub fn deinit(self: *WebSocketClient) void {
+                self.session.close(.normal, "") catch {};
+                self.client.pool.checkin(self.conn, false);
+                self.client.gpa.free(self.msg_buf);
+            }
+        };
+
+        /// Dials `spec.origin`, performs the RFC 6455 handshake over the client's
+        /// pool/TLS/timeout machinery, and hands back a live `WebSocketClient` on
+        /// the hijacked connection. `wss` is served automatically when the Client
+        /// was built with a TLS connector. Returns `error.HandshakeFailed` if the
+        /// server's response is not a valid 101 upgrade.
+        pub fn webSocket(self: *Self, spec: WebSocketSpec) !WebSocketClient {
+            // A fresh random 16-byte nonce, base64-encoded (RFC 6455 §4.1). It
+            // need only be unique per connection; `random` (the executor CSPRNG)
+            // suffices and the value lives on this frame across the handshake.
+            var nonce: [16]u8 = undefined;
+            zio.random(&nonce);
+            var key_buf: [std.base64.standard.Encoder.calcSize(16)]u8 = undefined;
+            const key = std.base64.standard.Encoder.encode(&key_buf, &nonce);
+
+            // Handshake headers appended after the caller's own. 3 = key +
+            // version (+ optional subprotocol).
+            var hbuf: [16]Header = undefined;
+            if (spec.extra_headers.len + 3 > hbuf.len) return WebSocketError.TooManyHeaders;
+            @memcpy(hbuf[0..spec.extra_headers.len], spec.extra_headers);
+            var hn = spec.extra_headers.len;
+            hbuf[hn] = .{ .name = "sec-websocket-key", .value = key };
+            hn += 1;
+            hbuf[hn] = .{ .name = "sec-websocket-version", .value = "13" };
+            hn += 1;
+            if (spec.subprotocol) |sp| {
+                hbuf[hn] = .{ .name = "sec-websocket-protocol", .value = sp };
+                hn += 1;
+            }
+
+            const resp = try self.request(.{
+                .origin = spec.origin,
+                .target = spec.target,
+                .extra_headers = hbuf[0..hn],
+                .upgrade = "websocket",
+                // A WebSocket stream is long-lived and may be silent: no read/
+                // total deadline unless the caller bounds the read explicitly.
+                .timeouts = .{ .read = spec.read_timeout, .total = .none },
+            });
+
+            // Validate the 101. On any mismatch, destroy the connection (it is
+            // not a usable WebSocket and cannot be safely pooled) and fail.
+            errdefer resp.pool.checkin(resp.conn, false);
+            if (resp.status() != 101) return WebSocketError.HandshakeFailed;
+            const upg = resp.header("upgrade") orelse return WebSocketError.HandshakeFailed;
+            if (!codec.ws.headerHasToken(upg, "websocket")) return WebSocketError.HandshakeFailed;
+            const conn_hdr = resp.header("connection") orelse return WebSocketError.HandshakeFailed;
+            if (!codec.ws.headerHasToken(conn_hdr, "upgrade")) return WebSocketError.HandshakeFailed;
+            var expected: [codec.ws.accept_len]u8 = undefined;
+            codec.ws.computeAccept(key, &expected);
+            const got = resp.header("sec-websocket-accept") orelse return WebSocketError.HandshakeFailed;
+            if (!std.mem.eql(u8, got, &expected)) return WebSocketError.HandshakeFailed;
+            if (spec.subprotocol) |sp| {
+                // When we offered a subprotocol, the server must echo exactly it.
+                const chosen = resp.header("sec-websocket-protocol") orelse return WebSocketError.HandshakeFailed;
+                if (!std.mem.eql(u8, chosen, sp)) return WebSocketError.HandshakeFailed;
+            }
+
+            // Hijack: keep the connection (do not deinit the Response, which
+            // would drain + pool it) and drive frames straight off its reader.
+            const msg_buf = try self.gpa.alloc(u8, spec.max_message_size);
+            const conn = resp.conn;
+            return .{
+                .client = self,
+                .conn = conn,
+                .session = .{ .reader = conn.reader(), .writer = conn.writer(), .msg_buf = msg_buf },
+                .msg_buf = msg_buf,
             };
         }
     };
