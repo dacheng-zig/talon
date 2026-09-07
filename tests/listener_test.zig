@@ -76,3 +76,60 @@ test "MemoryListener: close unblocks accept with Closed" {
     try group.wait();
     try std.testing.expect(!group.hasFailed());
 }
+
+test "MemoryListener: closed queue rolls back pair ownership" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var listener = try MemoryListener.init(std.testing.allocator, .{});
+    defer listener.deinit();
+    listener.close();
+    try std.testing.expectError(error.Closed, listener.connect());
+    try std.testing.expectEqual(@as(usize, 0), listener.pairs.items.len);
+}
+
+test "MemoryListener: cancellation while queue is full rolls back only that pair" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var listener = try MemoryListener.init(std.testing.allocator, .{ .backlog = 1 });
+    defer listener.deinit();
+    const first = try listener.connect();
+    defer first.close();
+    const F = struct {
+        fn connect(l: *MemoryListener, started: *zio.ResetEvent) !void {
+            started.set();
+            try std.testing.expectError(error.Canceled, l.connect());
+        }
+    };
+    var started: zio.ResetEvent = .init;
+    var task = try zio.spawn(F.connect, .{ &listener, &started });
+    try started.wait();
+    var queued = false;
+    for (0..1000) |_| {
+        listener.pairs_mutex.lockUncancelable();
+        queued = listener.pairs.items.len == 2;
+        listener.pairs_mutex.unlock();
+        if (queued) break;
+        try zio.sleep(.fromMilliseconds(1));
+    }
+    task.cancel();
+    try task.join();
+    try std.testing.expect(queued);
+    try std.testing.expectEqual(@as(usize, 1), listener.pairs.items.len);
+    const accepted = try listener.accept();
+    accepted.close();
+    listener.close();
+}
+
+test "MemoryListener: allocation failure leaves no registered pair" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const F = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var listener = try MemoryListener.init(gpa, .{});
+            defer listener.deinit();
+            const conn = try listener.connect();
+            conn.close();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}

@@ -45,6 +45,14 @@ pub const Body = union(enum) {
     }
 };
 
+/// Pool-owned origin state. References cover both waiters and permit holders;
+/// all reference-count mutations are protected by the pool mutex.
+pub const OriginPermit = struct {
+    sem: zio.Semaphore,
+    users: usize = 1,
+    key: []const u8,
+};
+
 pub fn ClientConnection(comptime Raw: type) type {
     return struct {
         /// Transport I/O storage + lifecycle, abstracted over whether the
@@ -85,6 +93,7 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// Owned copy of this connection's origin key (e.g. "http://h:80"),
         /// so the pool can re-bucket it on checkin. Empty until the pool sets it.
         origin_key: []const u8 = &.{},
+        pool_permit: ?*OriginPermit = null,
 
         const Self = @This();
 
@@ -153,7 +162,7 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// server's Connection.setReadTimeout. It stays in effect until changed,
         /// so a deadline set before reading the response head also bounds the
         /// streamed body reads that follow. No-op on transports without timeout
-        /// support (memory pipes).
+        /// support. TCP and memory pipes both support timeouts.
         pub fn setReadTimeout(self: *Self, timeout: zio.Timeout) void {
             self.transport.setReadTimeout(timeout);
         }
@@ -161,6 +170,26 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// Per-write deadline; bounds sending the request head and body.
         pub fn setWriteTimeout(self: *Self, timeout: zio.Timeout) void {
             self.transport.setWriteTimeout(timeout);
+        }
+
+        /// Stored underlying read failure, not the status of a buffered read.
+        /// Inspect immediately after ReadFailed; successful I/O need not clear
+        /// transport error storage. False also means diagnostics are unavailable.
+        pub fn lastReadTimedOut(self: *const Self) bool {
+            return self.transport.lastReadTimedOut();
+        }
+
+        /// Stored underlying write failure; same availability/lifetime as read.
+        pub fn lastWriteTimedOut(self: *const Self) bool {
+            return self.transport.lastWriteTimedOut();
+        }
+
+        pub fn lastReadCanceled(self: *const Self) bool {
+            return self.transport.lastReadCanceled();
+        }
+
+        pub fn lastWriteCanceled(self: *const Self) bool {
+            return self.transport.lastWriteCanceled();
         }
 
         /// Best-effort liveness probe for an *idle* pooled connection: a short
@@ -315,6 +344,18 @@ fn Transport(comptime Raw: type) type {
     return if (pinned) PinnedTransport(Raw) else ValueTransport(Raw);
 }
 
+// An `err` field is conventional, not required by the transport contract.
+fn storedErrorIs(state: anytype, expected: anyerror) bool {
+    const T = @TypeOf(state);
+    if (comptime @hasField(T, "err")) {
+        const info = @typeInfo(@FieldType(T, "err"));
+        if (comptime info == .optional and @typeInfo(info.optional.child) == .error_set) {
+            return if (state.err) |err| @as(anyerror, err) == expected else false;
+        }
+    }
+    return false;
+}
+
 /// Value-type transport storage (plain TCP / memory): owns the read/write
 /// buffers and the value-type reader/writer states whose `interface` field is
 /// recovered via `@fieldParentPtr` — hence pinned inside the heap-stable
@@ -369,6 +410,22 @@ fn ValueTransport(comptime Raw: type) type {
         fn setWriteTimeout(self: *Self, timeout: zio.Timeout) void {
             if (comptime std.meta.hasMethod(Raw.Writer, "setTimeout"))
                 self.writer_state.setTimeout(timeout);
+        }
+
+        fn lastReadTimedOut(self: *const Self) bool {
+            return storedErrorIs(self.reader_state, error.Timeout);
+        }
+
+        fn lastWriteTimedOut(self: *const Self) bool {
+            return storedErrorIs(self.writer_state, error.Timeout);
+        }
+
+        fn lastReadCanceled(self: *const Self) bool {
+            return storedErrorIs(self.reader_state, error.Canceled);
+        }
+
+        fn lastWriteCanceled(self: *const Self) bool {
+            return storedErrorIs(self.writer_state, error.Canceled);
         }
 
         fn isLikelyLive(self: *Self) bool {
@@ -430,6 +487,30 @@ fn PinnedTransport(comptime Raw: type) type {
 
         fn setWriteTimeout(self: *Self, timeout: zio.Timeout) void {
             self.raw.setWriteTimeout(timeout);
+        }
+
+        fn lastReadTimedOut(self: *const Self) bool {
+            if (comptime std.meta.hasMethod(Raw, "lastReadTimedOut"))
+                return self.raw.lastReadTimedOut();
+            return false;
+        }
+
+        fn lastWriteTimedOut(self: *const Self) bool {
+            if (comptime std.meta.hasMethod(Raw, "lastWriteTimedOut"))
+                return self.raw.lastWriteTimedOut();
+            return false;
+        }
+
+        fn lastReadCanceled(self: *const Self) bool {
+            if (comptime std.meta.hasMethod(Raw, "lastReadCanceled"))
+                return self.raw.lastReadCanceled();
+            return false;
+        }
+
+        fn lastWriteCanceled(self: *const Self) bool {
+            if (comptime std.meta.hasMethod(Raw, "lastWriteCanceled"))
+                return self.raw.lastWriteCanceled();
+            return false;
         }
 
         fn isLikelyLive(self: *Self) bool {
@@ -519,4 +600,71 @@ test "responseHasBody: method and status rules" {
     try std.testing.expect(!responseHasBody(.GET, 100));
     try std.testing.expect(!responseHasBody(.CONNECT, 200));
     try std.testing.expect(responseHasBody(.POST, 201));
+}
+
+test "transport diagnostics are optional for custom transports" {
+    var pinned: PinnedTransport(struct {}) = .{ .raw = .{} };
+    try std.testing.expect(!pinned.lastReadTimedOut());
+    try std.testing.expect(!pinned.lastWriteTimedOut());
+    try std.testing.expect(!pinned.lastReadCanceled());
+    try std.testing.expect(!pinned.lastWriteCanceled());
+    const Raw = struct {
+        pub const Reader = struct { err: ?error{Closed} = null };
+        pub const Writer = struct { err: u32 = 0 };
+    };
+    var value: ValueTransport(Raw) = .{
+        .raw = .{},
+        .reader_state = .{ .err = error.Closed },
+        .writer_state = .{},
+        .read_buf = &.{},
+        .write_buf = &.{},
+    };
+    try std.testing.expect(!value.lastReadTimedOut());
+    try std.testing.expect(!value.lastWriteTimedOut());
+    try std.testing.expect(!value.lastReadCanceled());
+    try std.testing.expect(!value.lastWriteCanceled());
+}
+
+test "value transport reports read and write timeout and cancellation causes" {
+    const listener_mod = @import("../../core/listener.zig");
+    const C = ClientConnection(listener_mod.MemoryConnection);
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    for ([_]bool{ false, true }) |writing| {
+        for ([_]bool{ false, true }) |canceling| {
+            var listener = try listener_mod.MemoryListener.init(std.testing.allocator, .{ .pipe_buffer_size = 8 });
+            defer listener.deinit();
+            const conn = try C.create(std.testing.allocator, try listener.connect());
+            defer conn.destroy();
+            const peer = try listener.accept();
+            defer peer.close();
+            const timeout: zio.Timeout = if (canceling) .none else .fromMilliseconds(1);
+            conn.setReadTimeout(timeout);
+            conn.setWriteTimeout(timeout);
+            const F = struct {
+                fn run(c: *C, write: bool, cancel: bool, started: *zio.ResetEvent) !void {
+                    started.set();
+                    if (write) {
+                        try c.writer().writeAll("x" ** 32);
+                        try std.testing.expectError(error.WriteFailed, c.writer().flush());
+                        try std.testing.expectEqual(!cancel, c.lastWriteTimedOut());
+                        try std.testing.expectEqual(cancel, c.lastWriteCanceled());
+                        try std.testing.expect(!c.lastReadTimedOut());
+                        try std.testing.expect(!c.lastReadCanceled());
+                    } else {
+                        try std.testing.expectError(error.ReadFailed, c.reader().takeByte());
+                        try std.testing.expectEqual(!cancel, c.lastReadTimedOut());
+                        try std.testing.expectEqual(cancel, c.lastReadCanceled());
+                        try std.testing.expect(!c.lastWriteTimedOut());
+                        try std.testing.expect(!c.lastWriteCanceled());
+                    }
+                }
+            };
+            var started: zio.ResetEvent = .init;
+            var task = try zio.spawn(F.run, .{ conn, writing, canceling, &started });
+            try started.wait();
+            if (canceling) task.cancel();
+            try task.join();
+        }
+    }
 }

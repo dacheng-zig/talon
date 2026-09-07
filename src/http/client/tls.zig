@@ -94,6 +94,17 @@ pub const TlsConnector = struct {
     }
 };
 
+fn connectTcp(origin: Origin, timeout: zio.Timeout) !zio.net.Stream {
+    if (numericAddress(origin)) |address| {
+        return zio.net.tcpConnectToAddress(address, .{ .timeout = timeout });
+    }
+    return zio.net.tcpConnectToHost(origin.host, origin.port, .{ .timeout = timeout });
+}
+
+fn numericAddress(origin: Origin) ?zio.net.IpAddress {
+    return zio.net.IpAddress.parseIp(origin.host, origin.port) catch null;
+}
+
 // ── Transport ────────────────────────────────────────────────────────────────
 
 /// A dialed connection — TLS or plaintext — presented as a pinned transport.
@@ -150,7 +161,7 @@ pub const TlsTransport = struct {
     }
 
     fn connectPlain(gpa: std.mem.Allocator, origin: Origin, timeout: zio.Timeout) !TlsTransport {
-        const stream = try zio.net.tcpConnectToHost(origin.host, origin.port, .{ .timeout = timeout });
+        const stream = try connectTcp(origin, timeout);
         stream.socket.setNoDelay(true) catch {};
         const state = allocState(gpa, stream) catch |err| {
             stream.close();
@@ -166,7 +177,7 @@ pub const TlsTransport = struct {
         origin: Origin,
         timeout: zio.Timeout,
     ) !TlsTransport {
-        const stream = try zio.net.tcpConnectToHost(origin.host, origin.port, .{ .timeout = timeout });
+        const stream = try connectTcp(origin, timeout);
         stream.socket.setNoDelay(true) catch {};
         errdefer stream.close();
 
@@ -260,6 +271,22 @@ pub const TlsTransport = struct {
         self.state.tcp_writer.setTimeout(timeout);
     }
 
+    pub fn lastReadTimedOut(self: TlsTransport) bool {
+        return if (self.state.tcp_reader.err) |err| err == error.Timeout else false;
+    }
+
+    pub fn lastWriteTimedOut(self: TlsTransport) bool {
+        return if (self.state.tcp_writer.err) |err| err == error.Timeout else false;
+    }
+
+    pub fn lastReadCanceled(self: TlsTransport) bool {
+        return if (self.state.tcp_reader.err) |err| err == error.Canceled else false;
+    }
+
+    pub fn lastWriteCanceled(self: TlsTransport) bool {
+        return if (self.state.tcp_writer.err) |err| err == error.Canceled else false;
+    }
+
     /// Liveness probe for an idle pooled connection: a short bounded read on the
     /// encrypted socket. A healthy idle keep-alive has no pending bytes (the
     /// probe times out → live); a peer-closed socket returns EOF at once
@@ -313,6 +340,21 @@ test "TlsConnector: declares the pinned-transport contract" {
     try std.testing.expect(TlsConnector.RawConnection.pinned_transport);
     // The connector is a plain value: allocator + io + verification.
     try std.testing.expect(@hasField(TlsConnector, "verification"));
+}
+
+test "numericAddress recognizes IP literals without resolving hostnames" {
+    const ipv4 = numericAddress(.{ .host = "127.0.0.1", .port = 19091 }).?;
+    try std.testing.expectEqual(zio.net.IpAddress.Family.ipv4, ipv4.getFamily());
+    try std.testing.expectEqual(@as(u16, 19091), ipv4.getPort());
+
+    const ipv6 = numericAddress(.{ .host = "::1", .port = 443 }).?;
+    try std.testing.expectEqual(zio.net.IpAddress.Family.ipv6, ipv6.getFamily());
+    try std.testing.expectEqual(@as(u16, 443), ipv6.getPort());
+
+    try std.testing.expect(numericAddress(.{
+        .host = "example.test",
+        .port = 80,
+    }) == null);
 }
 
 test "record buffers are at least one max ciphertext record" {

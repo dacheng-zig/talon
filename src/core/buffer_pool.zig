@@ -78,6 +78,7 @@ pub const BufferPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const buf = self.free.pop() orelse try self.gpa.alloc(u8, self.buffer_size);
+        errdefer self.gpa.free(buf); // debug tracking allocation may fail
         if (track_borrows) {
             try self.borrows.put(@intFromPtr(buf.ptr), return_addr);
         }
@@ -137,4 +138,16 @@ test "BufferPool: debug borrow tracking flags unreturned buffers" {
     pool.give(a);
     try std.testing.expectEqual(0, pool.borrows.count());
     pool.deinit();
+}
+
+test "BufferPool: allocation failure during borrow tracking does not leak" {
+    const F = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var pool = try BufferPool.init(gpa, .{ .buffer_size = 64 });
+            defer pool.deinit();
+            const buf = try pool.rent();
+            pool.give(buf);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
 }

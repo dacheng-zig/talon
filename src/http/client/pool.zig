@@ -34,6 +34,7 @@ const std = @import("std");
 const zio = @import("zio");
 const connector_mod = @import("connector.zig");
 const conn_mod = @import("connection.zig");
+const OriginPermit = conn_mod.OriginPermit;
 
 pub const Origin = connector_mod.Origin;
 pub const SpinLock = @import("../../core/buffer_pool.zig").SpinLock;
@@ -106,7 +107,7 @@ pub fn Pool(comptime Connector: type) type {
         buckets: std.StringHashMap(Bucket),
         /// Per-origin in-flight permits (lazily created when max_per_origin is
         /// set). Heap-allocated so the Semaphore address stays stable.
-        sems: std.StringHashMap(*zio.Semaphore),
+        sems: std.StringHashMap(*OriginPermit),
         idle_total: usize = 0,
         created: std.atomic.Value(u64) = .init(0),
         reused: std.atomic.Value(u64) = .init(0),
@@ -130,13 +131,13 @@ pub fn Pool(comptime Connector: type) type {
                 .connector = connector,
                 .config = config,
                 .buckets = std.StringHashMap(Bucket).init(gpa),
-                .sems = std.StringHashMap(*zio.Semaphore).init(gpa),
+                .sems = std.StringHashMap(*OriginPermit).init(gpa),
             };
         }
 
-        /// Closes every idle connection and frees all pool memory. In-flight
-        /// connections (checked out, not yet returned) are owned by their
-        /// Response and are not touched here.
+        /// Closes idle connections and frees pool state. All checkouts,
+        /// Responses, WebSockets and concurrent pool operations must have
+        /// finished before deinit; they borrow the pool and its origin state.
         pub fn deinit(self: *Self) void {
             var it = self.buckets.iterator();
             while (it.next()) |e| {
@@ -171,17 +172,21 @@ pub fn Pool(comptime Connector: type) type {
 
             // In-flight backpressure: acquire a per-origin permit before
             // reusing/dialing. Held until the matching checkin releases it.
+            var permit: ?*OriginPermit = null;
             if (self.config.max_per_origin) |max| {
                 if (key) |k| {
-                    const sem = try self.originSem(k, max);
-                    sem.timedWait(self.config.pool_wait) catch return error.PoolWaitTimeout;
+                    const state = try self.retainOrigin(k, max);
+                    state.sem.timedWait(self.config.pool_wait) catch |err| {
+                        self.releaseOrigin(state, false);
+                        return if (err == error.Canceled) error.Canceled else error.PoolWaitTimeout;
+                    };
+                    permit = state;
                 }
             }
-            // On any failure to produce a connection, release the permit we just
-            // took (a returned connection carries it to its checkin instead).
-            errdefer if (self.config.max_per_origin != null) {
-                if (key) |k| if (self.semFor(k)) |s| s.post();
-            };
+            errdefer if (permit) |state| self.releaseOrigin(state, true);
+            // An expired/stale idle connection can leave an empty warm bucket.
+            // Redial failure must reclaim it even when permits are disabled.
+            errdefer if (key) |k| self.dropEmptyBucketIfPresent(k);
 
             if (key) |k| {
                 // Pop newest-first (LIFO keeps the warmest connection hot and
@@ -196,41 +201,67 @@ pub fn Pool(comptime Connector: type) type {
                         continue;
                     }
                     _ = self.reused.fetchAdd(1, .monotonic);
+                    entry.conn.pool_permit = permit;
                     return .{ .conn = entry.conn, .reused = true };
                 }
             }
-            return .{ .conn = try self.dial(origin, key, connect_timeout), .reused = false };
+            const conn = try self.dial(origin, key, connect_timeout);
+            // A best-effort key allocation may fail even though dialing succeeds.
+            // Such a connection cannot later identify its empty warm bucket.
+            if (conn.origin_key.len == 0) {
+                if (key) |k| self.dropEmptyBucketIfPresent(k);
+            }
+            conn.pool_permit = permit;
+            return .{ .conn = conn, .reused = false };
         }
 
         /// Returns a connection to the pool when `reusable`, else closes it.
         /// Never errors: a connection that cannot be pooled (caps hit, alloc
         /// failure, unpoolable origin) is simply closed.
         pub fn checkin(self: *Self, conn: *Conn, reusable: bool) void {
-            // Release the in-flight permit this connection's checkout held. Done
-            // first and unconditionally so it is never skipped by an early
-            // return below (a leaked permit would wedge the origin).
-            if (self.config.max_per_origin != null and conn.origin_key.len != 0) {
-                if (self.semFor(conn.origin_key)) |s| s.post();
+            // Keep the origin alive until checkin has either stored or destroyed
+            // the connection. The permit owns its key independently of conn.
+            const permit = conn.pool_permit;
+            conn.pool_permit = null;
+            defer if (permit) |state| self.releaseOrigin(state, true);
+            if (!reusable or conn.origin_key.len == 0) {
+                self.dropEmptyBucketIfPresent(conn.origin_key);
+                return conn.destroy();
             }
-            if (!reusable or conn.origin_key.len == 0) return conn.destroy();
             // Don't pool a connection already past its lifetime — it would be
             // evicted on the very next checkout anyway.
             if (self.config.connection_lifetime) |life| {
-                if (nowNs() -| conn.created_ns >= life.toNanoseconds()) return conn.destroy();
+                if (nowNs() -| conn.created_ns >= life.toNanoseconds()) {
+                    self.dropEmptyBucketIfPresent(conn.origin_key);
+                    return conn.destroy();
+                }
             }
 
             self.mutex.lock();
             if (self.idle_total >= self.config.max_idle_total) {
                 self.mutex.unlock();
+                self.dropEmptyBucketIfPresent(conn.origin_key);
                 return conn.destroy();
             }
-            // The map must own its key independently of any connection's
-            // lifetime (a pooled conn may be destroyed while siblings keep the
-            // bucket alive). Own the key BEFORE getOrPut: a getOrPut that
-            // inserts a slot then fails its follow-up dupe cannot truly roll
-            // back — `remove` of an undefined-keyed slot mismatches and leaves a
-            // poisoned entry that corrupts deinit. dupe → getOrPut → free the
-            // surplus copy on a hit.
+            if (self.buckets.getPtr(conn.origin_key)) |bucket| {
+                if (bucket.items.len >= self.config.max_idle_per_origin) {
+                    self.mutex.unlock();
+                    self.dropEmptyBucketIfPresent(conn.origin_key);
+                    return conn.destroy();
+                }
+                bucket.append(self.gpa, .{ .conn = conn, .idle_ns = nowNs() }) catch {
+                    self.mutex.unlock();
+                    return conn.destroy();
+                };
+                self.idle_total += 1;
+                self.mutex.unlock();
+                return;
+            }
+
+            // A newly created bucket must own its key independently of every
+            // connection's lifetime. Existing buckets take the fast path above:
+            // duplicating and immediately freeing a key on every checkin made
+            // keep-alive reuse pay an allocator round-trip per response.
             const owned_key = self.gpa.dupe(u8, conn.origin_key) catch {
                 self.mutex.unlock();
                 return conn.destroy();
@@ -240,18 +271,17 @@ pub fn Pool(comptime Connector: type) type {
                 self.mutex.unlock();
                 return conn.destroy();
             };
-            if (gop.found_existing) {
-                self.gpa.free(owned_key);
-            } else {
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = .empty;
-            }
+            std.debug.assert(!gop.found_existing);
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .empty;
             if (gop.value_ptr.items.len >= self.config.max_idle_per_origin) {
                 self.mutex.unlock();
+                self.dropEmptyBucketIfPresent(conn.origin_key);
                 return conn.destroy();
             }
             gop.value_ptr.append(self.gpa, .{ .conn = conn, .idle_ns = nowNs() }) catch {
                 self.mutex.unlock();
+                self.dropEmptyBucketIfPresent(conn.origin_key);
                 return conn.destroy();
             };
             self.idle_total += 1;
@@ -309,37 +339,58 @@ pub fn Pool(comptime Connector: type) type {
             if (self.buckets.fetchRemove(key)) |kv| {
                 var bucket = kv.value;
                 bucket.deinit(self.gpa);
+                self.collectOrigin(kv.key);
                 self.gpa.free(kv.key);
             }
         }
 
-        /// Gets or lazily creates the per-origin in-flight semaphore (heap, so
-        /// its address is stable across map growth). Allocation happens under
-        /// the lock — no suspension point, consistent with the rest of the pool.
-        fn originSem(self: *Self, key: []const u8, max: usize) !*zio.Semaphore {
+        fn dropEmptyBucketIfPresent(self: *Self, key: []const u8) void {
+            if (key.len == 0) return;
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.sems.get(key)) |s| return s;
-            // Build the owned key + semaphore before touching the map, so a slot
-            // is never left holding an undefined key on OOM (same rollback
-            // hazard as checkin). getOrPut here is guaranteed !found_existing
-            // (we hold the lock and `get` just missed); if it OOMs, the errdefers
-            // free the unused key/sem and no poisoned slot remains.
-            const owned = try self.gpa.dupe(u8, key);
-            errdefer self.gpa.free(owned);
-            const sem = try self.gpa.create(zio.Semaphore);
-            errdefer self.gpa.destroy(sem);
-            sem.* = .{ .permits = max };
-            const gop = try self.sems.getOrPut(owned);
-            gop.key_ptr.* = owned;
-            gop.value_ptr.* = sem;
-            return sem;
+            if (self.buckets.getPtr(key)) |bucket| {
+                if (bucket.items.len == 0) self.dropBucket(key);
+            }
         }
 
-        fn semFor(self: *Self, key: []const u8) ?*zio.Semaphore {
+        /// Retain before waiting, so a returning holder cannot free a semaphore
+        /// that a waiter is about to use. Caller later releases on every path.
+        fn retainOrigin(self: *Self, key: []const u8, max: usize) !*OriginPermit {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return self.sems.get(key);
+            if (self.sems.get(key)) |state| {
+                state.users += 1;
+                return state;
+            }
+            const owned = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(owned);
+            const state = try self.gpa.create(OriginPermit);
+            errdefer self.gpa.destroy(state);
+            state.* = .{ .sem = .{ .permits = max }, .key = owned };
+            try self.sems.put(owned, state);
+            return state;
+        }
+
+        fn releaseOrigin(self: *Self, state: *OriginPermit, held: bool) void {
+            // post can wake another task. This reference remains live until
+            // post returns; the awakened waiter already owns its own reference.
+            if (held) state.sem.post();
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            std.debug.assert(state.users != 0);
+            state.users -= 1;
+            self.collectOrigin(state.key);
+        }
+
+        /// Under the pool lock. Idle connections retain warm origin state;
+        /// removing their last bucket triggers collection as well.
+        fn collectOrigin(self: *Self, key: []const u8) void {
+            const state = self.sems.get(key) orelse return;
+            if (state.users != 0) return;
+            if (self.buckets.get(key)) |bucket| if (bucket.items.len != 0) return;
+            _ = self.sems.remove(key);
+            self.gpa.free(state.key);
+            self.gpa.destroy(state);
         }
 
         fn popIdle(self: *Self, key: []const u8) ?Entry {
@@ -348,11 +399,10 @@ pub fn Pool(comptime Connector: type) type {
             const bucket = self.buckets.getPtr(key) orelse return null;
             const entry = bucket.pop() orelse return null;
             self.idle_total -= 1;
-            // Drop the bucket once empty so the map tracks active origins, not
-            // every origin ever dialed (unbounded growth for a long-lived
-            // client). `bucket` is invalidated by the removal; we use neither
-            // after.
-            if (bucket.items.len == 0) self.dropBucket(key);
+            // Keep an empty bucket while its connection is checked out. A
+            // closed-loop client commonly has one idle connection per origin;
+            // removing the bucket here would force its next checkin to rebuild
+            // the map entry and backing array on every request.
             return entry;
         }
 
@@ -366,20 +416,9 @@ pub fn Pool(comptime Connector: type) type {
             // An owned key lets this connection re-bucket on checkin. If the
             // origin was unpoolable (too long) or the dupe fails, the key stays
             // empty and the connection is simply never returned to the pool.
-            if (key) |k| conn.origin_key = self.gpa.dupe(u8, k) catch blk: {
-                // Recording the key failed (OOM): this connection can never be
-                // pooled. But checkout already took an in-flight permit for this
-                // origin, and checkin releases by `origin_key` — which stays
-                // empty here, so the release would be skipped and the permit
-                // leaked, permanently wedging the origin. Release it now, while
-                // `k` is still in hand (the only place that key is available
-                // without a stored copy). errdefer in checkout does not fire
-                // because dial returns this connection successfully.
-                if (self.config.max_per_origin != null) {
-                    if (self.semFor(k)) |s| s.post();
-                }
-                break :blk &.{};
-            };
+            // Permit ownership is stored separately, so even an unpooled
+            // connection whose key allocation fails keeps its concurrency slot.
+            if (key) |k| conn.origin_key = self.gpa.dupe(u8, k) catch &.{};
             _ = self.created.fetchAdd(1, .monotonic);
             return conn;
         }

@@ -1268,6 +1268,21 @@ test "client: sends policy default headers, caller overrides win" {
                 try std.testing.expectEqualStrings("talon-http-client/1.0|*/*|<none>", body);
             }
 
+            // Disabling defaults preserves explicit caller headers.
+            for ([_]bool{ false, true }) |explicit| {
+                var c = Client.init(std.testing.allocator, .{ .listener = l }, .{ .default_headers = false });
+                defer c.deinit();
+                var resp = try c.request(.{ .origin = origin, .extra_headers = if (explicit) &.{
+                    .{ .name = "User-Agent", .value = "custom/9" },
+                    .{ .name = "Accept", .value = "application/json" },
+                    .{ .name = "Accept-Encoding", .value = "identity" },
+                } else &.{} });
+                defer resp.deinit();
+                const body = try readBody(resp);
+                defer std.testing.allocator.free(body);
+                try std.testing.expectEqualStrings(if (explicit) "custom/9|application/json|identity" else "<none>|<none>|<none>", body);
+            }
+
             // Caller-supplied headers override the defaults (no duplicates).
             {
                 var c = Client.init(std.testing.allocator, .{ .listener = l }, .{});
@@ -1362,4 +1377,173 @@ test "client: streaming upload (Content-Length and chunked) round-trips" {
     try group.spawn(Fns.runClient, .{ &listener, &server, payload });
     try group.wait();
     try std.testing.expect(!group.hasFailed());
+}
+
+test "client: origin permits reclaim idle history and survive waiting cancellation" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    var listener = try MemoryListener.init(std.testing.allocator, .{});
+    defer listener.deinit();
+    const C = client.Client(client.MemoryConnector);
+    var c = C.init(std.testing.allocator, .{ .listener = &listener }, .{
+        .pool = .{ .max_per_origin = 1, .pool_wait = .fromSeconds(2), .idle_timeout = .fromNanoseconds(1) },
+    });
+    defer c.deinit();
+    for (0..40) |i| {
+        var name: [32]u8 = undefined;
+        const origin: client.Origin = .{ .host = try std.fmt.bufPrint(&name, "origin-{d}", .{i}), .port = 80 };
+        const co = try c.pool.checkout(origin, .none);
+        const peer = try listener.accept();
+        c.pool.checkin(co.conn, true);
+        peer.close();
+        _ = c.pool.reapExpired();
+        try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+    }
+    const origin: client.Origin = .{ .host = "held", .port = 80 };
+    const co = try c.pool.checkout(origin, .none);
+    const peer = try listener.accept();
+    defer peer.close();
+    const F = struct {
+        fn wait(cl: *C, o: client.Origin) !void {
+            try std.testing.expectError(error.Canceled, cl.pool.checkout(o, .none));
+        }
+    };
+    var waiter = try zio.spawn(F.wait, .{ &c, origin });
+    // Observe the waiter reference under the same mutex as its mutation.
+    var ready = false;
+    for (0..1000) |_| {
+        c.pool.mutex.lock();
+        ready = co.conn.pool_permit.?.users == 2;
+        c.pool.mutex.unlock();
+        if (ready) break;
+        try zio.sleep(.fromMilliseconds(1));
+    }
+    waiter.cancel();
+    try waiter.join();
+    try std.testing.expect(ready);
+    c.pool.checkin(co.conn, false);
+    try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+    // A holder returning while a waiter wakes must not free that waiter's state.
+    const held = try c.pool.checkout(origin, .none);
+    const held_peer = try listener.accept();
+    defer held_peer.close();
+    const Handoff = struct {
+        fn run(cl: *C, l: *MemoryListener, o: client.Origin) !void {
+            const next = try cl.pool.checkout(o, .none);
+            const next_peer = try l.accept();
+            next_peer.close();
+            cl.pool.checkin(next.conn, false);
+        }
+    };
+    var handoff = try zio.spawn(Handoff.run, .{ &c, &listener, origin });
+    ready = false;
+    for (0..1000) |_| {
+        c.pool.mutex.lock();
+        ready = held.conn.pool_permit.?.users == 2;
+        c.pool.mutex.unlock();
+        if (ready) break;
+        try zio.sleep(.fromMilliseconds(1));
+    }
+    c.pool.checkin(held.conn, false);
+    try handoff.join();
+    try std.testing.expect(ready);
+    try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+    listener.close();
+    // Dial failures must also relinquish the last reference.
+    for (0..10) |_| try std.testing.expectError(error.Closed, c.pool.checkout(origin, .none));
+    try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+}
+
+test "client: failed redial reclaims an expired origin bucket" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    for ([_]?usize{ null, 1 }) |max| {
+        var listener = try MemoryListener.init(std.testing.allocator, .{});
+        defer listener.deinit();
+        const C = client.Client(client.MemoryConnector);
+        var c = C.init(std.testing.allocator, .{ .listener = &listener }, .{
+            .pool = .{ .max_per_origin = max, .idle_timeout = .fromSeconds(60) },
+        });
+        defer c.deinit();
+        const origin: client.Origin = .{ .host = "expired", .port = 80 };
+        const co = try c.pool.checkout(origin, .none);
+        const peer = try listener.accept();
+        peer.close();
+        c.pool.checkin(co.conn, true);
+        // Force expiry without relying on scheduler timing.
+        c.pool.config.idle_timeout = .fromNanoseconds(1);
+        try zio.sleep(.fromMilliseconds(1));
+        listener.close();
+        try std.testing.expectError(error.Closed, c.pool.checkout(origin, .none));
+        try std.testing.expectEqual(@as(usize, 0), c.pool.buckets.count());
+        try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+    }
+}
+
+test "client: pool allocation failures release ownership and permits" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const F = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var listener = try MemoryListener.init(std.testing.allocator, .{});
+            defer listener.deinit();
+            const C = client.Client(client.MemoryConnector);
+            var c = C.init(gpa, .{ .listener = &listener }, .{ .pool = .{ .max_per_origin = 1, .pool_wait = .fromMilliseconds(1) } });
+            defer c.deinit();
+            const origin: client.Origin = .{ .host = "oom", .port = 80 };
+            const co = try c.pool.checkout(origin, .none);
+            const peer = try listener.accept();
+            peer.close();
+            // Even a failed origin-key allocation must keep the permit held.
+            try std.testing.expectEqual(@as(usize, 1), co.conn.pool_permit.?.users);
+            try std.testing.expectError(error.PoolWaitTimeout, c.pool.checkout(origin, .none));
+            c.pool.checkin(co.conn, true);
+            c.pool.config.idle_timeout = .fromNanoseconds(1);
+            try zio.sleep(.fromMilliseconds(1));
+            const next = c.pool.checkout(origin, .none) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), c.pool.buckets.count());
+                try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+                return err;
+            };
+            const next_peer = try listener.accept();
+            next_peer.close();
+            try std.testing.expectError(error.PoolWaitTimeout, c.pool.checkout(origin, .none));
+            c.pool.checkin(next.conn, false);
+            try std.testing.expectEqual(@as(usize, 0), c.pool.buckets.count());
+            try std.testing.expectEqual(@as(usize, 0), c.pool.sems.count());
+        }
+    };
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try F.run(baseline.allocator());
+    // Pooling is best effort: OOM may validly return an unpooled connection.
+    // Enumerate failure points and verify ownership in both success/error cases.
+    for (0..baseline.allocations) |fail_index| {
+        var alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        F.run(alloc.allocator()) catch |err| if (err != error.OutOfMemory) return err;
+        try std.testing.expect(alloc.has_induced_failure);
+        try std.testing.expectEqual(alloc.allocated_bytes, alloc.freed_bytes);
+    }
+}
+
+test "client: warm pool reuse performs no allocations" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var listener = try MemoryListener.init(std.testing.allocator, .{});
+    defer listener.deinit();
+    var alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const C = client.Client(client.MemoryConnector);
+    var c = C.init(alloc.allocator(), .{ .listener = &listener }, .{ .pool = .{ .max_per_origin = 1 } });
+    defer c.deinit();
+    const origin: client.Origin = .{ .host = "warm", .port = 80 };
+    const first = try c.pool.checkout(origin, .none);
+    const peer = try listener.accept();
+    defer peer.close();
+    c.pool.checkin(first.conn, true);
+    const allocations = alloc.allocations;
+    for (0..20) |_| {
+        const co = try c.pool.checkout(origin, .none);
+        try std.testing.expect(co.reused);
+        c.pool.checkin(co.conn, true);
+    }
+    try std.testing.expectEqual(allocations, alloc.allocations);
 }

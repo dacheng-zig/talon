@@ -192,6 +192,18 @@ pub const MemoryListener = struct {
             defer self.pairs_mutex.unlock();
             try self.pairs.append(self.gpa, pair);
         }
+        // send() may fail on close or cancellation. Remove the registration
+        // before the allocation errdefers run; cleanup must survive cancellation.
+        errdefer {
+            self.pairs_mutex.lockUncancelable();
+            defer self.pairs_mutex.unlock();
+            for (self.pairs.items, 0..) |registered, i| {
+                if (registered == pair) {
+                    _ = self.pairs.swapRemove(i);
+                    break;
+                }
+            }
+        }
 
         try self.queue.send(.{
             .recv = &pair.client_to_server,

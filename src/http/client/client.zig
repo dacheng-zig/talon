@@ -87,7 +87,7 @@ pub const Timeouts = struct {
     /// (and across retries). Caps each stage to the tighter of its own timeout
     /// and the time left, so a peer dribbling bytes just under the per-read
     /// timeout still cannot drag the call out indefinitely. `.none` disables.
-    /// Only enforced on transports with timeout support (no-op on memory pipes).
+    /// Only enforced on transports with timeout support (no-op on custom transports without timeout support).
     total: zio.Timeout = .fromSeconds(60),
 };
 
@@ -428,6 +428,9 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// Optional caller-owned cookie jar used by the `cookies` middleware.
         /// null = no cookie handling. The Client only borrows it.
         cookie_jar: ?*CookieJar,
+        /// Whether ordinary requests add the policy User-Agent, Accept, and
+        /// Accept-Encoding headers when callers did not provide them.
+        default_headers: bool,
 
         const Self = @This();
         const default_max_response_body: u64 = 16 * 1024 * 1024;
@@ -443,6 +446,9 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             decompress: bool = true,
             /// Caller-owned cookie jar for the `cookies` middleware (null = off).
             cookie_jar: ?*CookieJar = null,
+            /// Add the policy User-Agent, Accept, and Accept-Encoding headers
+            /// unless the caller supplies the respective header.
+            default_headers: bool = true,
         };
 
         /// A received response. Borrows a live connection until `deinit`; header
@@ -568,6 +574,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .redirect = options.redirect,
                 .decompress = options.decompress,
                 .cookie_jar = options.cookie_jar,
+                .default_headers = options.default_headers,
             };
         }
 
@@ -793,9 +800,9 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .upgrade = spec.upgrade,
                 // Policy defaults, suppressed per-header when the caller (or a
                 // middleware, already merged into extra_headers) set their own.
-                .user_agent = if (headerPresent(spec.extra_headers, "user-agent")) null else default_user_agent,
-                .accept = if (headerPresent(spec.extra_headers, "accept")) null else default_accept,
-                .accept_encoding = if (self.decompress and !headerPresent(spec.extra_headers, "accept-encoding"))
+                .user_agent = if (self.default_headers and !headerPresent(spec.extra_headers, "user-agent")) default_user_agent else null,
+                .accept = if (self.default_headers and !headerPresent(spec.extra_headers, "accept")) default_accept else null,
+                .accept_encoding = if (self.default_headers and self.decompress and !headerPresent(spec.extra_headers, "accept-encoding"))
                     default_accept_encoding
                 else
                     null,
@@ -1113,6 +1120,26 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// Sends a ping (`data` ≤ 125 bytes).
             pub fn writePing(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
                 return self.session.writePing(data);
+            }
+
+            /// Inspect the stored transport cause immediately after an I/O
+            /// failure. Successful/buffered operations need not clear it; false
+            /// can also mean the custom transport has no diagnostic support.
+            /// These queries do not make a partially read frame safe to retry.
+            pub fn lastReadTimedOut(self: *const WebSocketClient) bool {
+                return self.conn.lastReadTimedOut();
+            }
+
+            pub fn lastWriteTimedOut(self: *const WebSocketClient) bool {
+                return self.conn.lastWriteTimedOut();
+            }
+
+            pub fn lastReadCanceled(self: *const WebSocketClient) bool {
+                return self.conn.lastReadCanceled();
+            }
+
+            pub fn lastWriteCanceled(self: *const WebSocketClient) bool {
+                return self.conn.lastWriteCanceled();
             }
 
             /// Sends a close frame (idempotent). The caller then stops reading.
