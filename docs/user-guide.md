@@ -214,7 +214,7 @@ var server = try talon.http.Server(App).init(gpa, &app, .{
 - `max_header_size`：head 超过即回 `431` 并关连接。
 - `max_body_size`：CL 在解析期预检（回 `413`），chunked 在读取期累计检查。
 - `header_read_timeout` / `keep_alive_timeout`：走 zio 内核级超时。
-- `min_body_data_rate` 字段已存在，但**慢速 body 速率防御（含心跳巡检）尚未启用**（规划在 M3）。
+- `min_body_data_rate` 已启用：通过累计网络等待预算和逐次读取期限执行，不依赖心跳巡检。完整语义见文末「资源限制与回归验证」。
 
 ---
 
@@ -364,3 +364,15 @@ zig build test          # 跑全部单元/集成测试
 zig build run-http      # 跑 HTTP 示例（127.0.0.1:8080）
 zig build run-resp      # 跑 RESP 示例（127.0.0.1:6380）
 ```
+
+
+## 资源限制与回归验证
+
+HTTP 服务默认启用以下限制，可通过 `Server.init` 的 `limits` 配置：
+
+- `header_read_timeout`：整个请求头的期限。新连接从首次等待读取开始计时；复用连接先按 `keep_alive_timeout` 等待首字节，再开始请求头期限。碎片数据不会重置期限。
+- `min_body_data_rate`：正文最低平均速率，默认 240 bytes/s，初始宽限 5s；只累计等待上游数据的时间，handler 计算、主动等待及输出背压不计入。已读取的正文提供后续等待额度，chunk 元数据不提供正文额度。`null` 禁用；速率和宽限期都必须大于零，否则初始化返回 `error.InvalidDataRate`。超限可从 `req.bodyError()` 返回的可选错误中识别 `error.BodyTooSlow`；未写响应且 handler 未处理该错误时返回 408。
+- `write_timeout`：响应写入无进展的等待期限，默认 30s；duration 在取得写入进展后重新计时，绝对 deadline 不会重置；适用于 HTTP、SSE 和 WebSocket 的底层写入。空闲 SSE 不执行写入，因此不会因没有事件而超时。`.none` 禁用。
+- `max_retained_arena`：每次请求结束后保留的 arena 容量上限，默认 64 KiB。它限制请求之间的保留量，不限制 handler 的峰值分配；`null` 保留高水位，`0` 全部释放。超出保留上限的工作负载可能在后续请求重新分配。
+
+TCP 和内存管道都支持读写超时。自定义传输若没有 `setTimeout` 方法，必须自行提供等价的等待限制；引擎无法替它中断阻塞读取。

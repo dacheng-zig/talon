@@ -4,8 +4,8 @@
 //! Per request: accumulate head (hand-written Accumulator
 //! specialization) → copy to arena → pure-function parse → handler → drain
 //! body → keep-alive or close. Hot path allocates only from the per-connection
-//! arena, which resets between requests with retained capacity — steady
-//! state is malloc-free.
+//! arena, which resets between requests with bounded retained capacity.
+//! Requests fitting that retained capacity reuse it without malloc.
 //!
 //! Why the arena copy of the head: header slices must stay valid while the
 //! handler reads the body through the same `std.Io.Reader`, whose buffer
@@ -68,7 +68,11 @@ pub fn Http1Protocol(comptime App: type) type {
                 .set_read_timeout_fn = UpgradeThunk.setReadTimeout,
             };
 
+            var first_request = true;
+            conn.setWriteTimeout(conn.limits.write_timeout);
             while (true) {
+                // Release unusually large request allocations before idling.
+                resetRequestArena(conn.arena, conn.limits.max_retained_arena);
                 // Ship pending responses only when the read side is about
                 // to park (no buffered request bytes left). While pipelined
                 // requests remain buffered, responses keep accumulating in
@@ -79,8 +83,10 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 // Request-boundary idle wait: interruptible by shutdown,
                 // bounded by the keep-alive budget.
-                conn.waitReadable(conn.limits.keep_alive_timeout) catch return;
-                conn.setReadTimeout(conn.limits.header_read_timeout);
+                const initial_deadline = conn.limits.header_read_timeout.toDeadline();
+                conn.waitReadable(if (first_request) initial_deadline else conn.limits.keep_alive_timeout) catch return;
+                conn.setReadTimeout(if (first_request) initial_deadline else conn.limits.header_read_timeout.toDeadline());
+                first_request = false;
 
                 const head_len = head_scan.findHeadEnd(r, conn.limits.max_header_size, w) catch |err| switch (err) {
                     error.CleanClose => return,
@@ -90,7 +96,6 @@ pub fn Http1Protocol(comptime App: type) type {
                     else => return, // truncated head / read failure / timeout
                 };
 
-                _ = conn.arena.reset(.retain_capacity);
                 const arena = conn.arena.allocator();
 
                 // Pin the head for the request's lifetime (see file doc).
@@ -116,6 +121,13 @@ pub fn Http1Protocol(comptime App: type) type {
                 else
                     &empty_body_buffer;
                 var body = body_mod.BodyReader.init(r, &head, conn.limits.max_body_size, body_buffer);
+                // The head deadline ends here. Body reads have an independent
+                // cumulative network-wait budget, not a repeatedly reset timer.
+                conn.setReadTimeout(.none);
+                var body_rate = BodyRate(@TypeOf(conn)){ .conn = conn };
+                if (has_body and conn.limits.min_body_data_rate != null) {
+                    body.read_policy = .{ .ctx = &body_rate, .before = BodyRate(@TypeOf(conn)).before, .after = BodyRate(@TypeOf(conn)).after };
+                }
 
                 if (head.expect_continue) {
                     // Eager 100-continue (Kestrel defers to first body read;
@@ -142,7 +154,7 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 app.handle(&req, &res) catch |err| {
                     if (!res.written) {
-                        respondErrorAndClose(w, &date_cache, .internal_server_error) catch {};
+                        respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req)) catch {};
                     } else {
                         w.flush() catch {};
                     }
@@ -156,7 +168,7 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 if (!res.written) {
                     // Handler contract violation: never leave the client hanging.
-                    return respondErrorAndClose(w, &date_cache, .internal_server_error);
+                    return respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req));
                 }
 
                 // Drain unread body so the next request parses cleanly; a
@@ -175,6 +187,13 @@ pub fn Http1Protocol(comptime App: type) type {
             }
         }
     };
+}
+
+fn bodyFailureStatus(req: *const Request) Status {
+    if (req.bodyError()) |err| {
+        if (err == error.BodyTooSlow) return .request_timeout;
+    }
+    return .internal_server_error;
 }
 
 fn statusForParseError(err: parser.ParseError) Status {
@@ -203,4 +222,55 @@ fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Stat
     }) catch return;
     w.writeAll(phrase) catch return;
     w.flush() catch return;
+}
+
+/// Cumulative network-wait accounting. Buffered payload earns credit, but
+/// handler CPU time, application sleeps, and downstream backpressure do not
+/// spend the client's upload budget. One policy lives for the entire body.
+fn BodyRate(comptime Conn: type) type {
+    return struct {
+        conn: Conn,
+        waited_ns: u64 = 0,
+        started_ns: u64 = 0,
+        allowance_ns: u64 = 0,
+        const Self = @This();
+
+        fn before(ctx: *anyopaque, produced: u64) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const rate = self.conn.limits.min_body_data_rate.?;
+            const credit: u128 = @as(u128, produced) * std.time.ns_per_s / rate.bytes_per_sec;
+            const allowance: u64 = @intCast(@min(std.math.maxInt(u64), credit + rate.grace.toNanoseconds()));
+            if (self.waited_ns >= allowance) return false;
+            self.allowance_ns = allowance;
+            self.started_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
+            self.conn.setReadTimeout(zio.Timeout.fromNanoseconds(allowance - self.waited_ns).toDeadline());
+            return true;
+        }
+
+        fn after(ctx: *anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.waited_ns +|= zio.Timestamp.now(.monotonic).toNanoseconds() -| self.started_ns;
+            self.conn.setReadTimeout(.none);
+            return self.waited_ns >= self.allowance_ns;
+        }
+    };
+}
+
+fn resetRequestArena(arena: *std.heap.ArenaAllocator, retained: ?usize) void {
+    if (!arena.reset(if (retained) |max| .{ .retain_with_limit = max } else .retain_capacity)) {
+        // std's reset may retain the old oversized allocation if shrinking
+        // requires a new allocation and that allocation fails.
+        _ = arena.reset(.free_all);
+    }
+}
+
+test "request arena: retention cap holds when shrinking allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var arena = std.heap.ArenaAllocator.init(failing.allocator());
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 128 * 1024);
+    failing.fail_index = failing.alloc_index;
+    resetRequestArena(&arena, 4096);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
 }

@@ -26,7 +26,7 @@
 | `Http1Protocol` keep-alive 循环 | ✅ | `src/http/protocol.zig` |
 | `UnixListener` | ❌ 未落地 | 架构 §5.2 预留，`listener.zig` 仅 tcp/memory |
 | 类型化 feature 查询 `conn.has/get`（§6） | ❌ 未落地 | `Connection` 仅有 `remoteInfo` 覆盖；`chain.provides` 已就绪但未接入 |
-| 慢速 body 速率防御 + 心跳（§5.6） | ❌ M3 | `Limits.min_body_data_rate` 已定义但不强制 |
+| 慢速 body 速率防御 | ✅ | 按上游读取等待时间累计预算；用 per-read deadline 执行，不需要独立心跳协程 |
 | `DatagramServer` / `SessionTable`（§9） | ❌ M3 | 文件尚未创建；底座按双消费者设计但未实现 UDP |
 | `ip_rate_limit` 中间件、`SO_REUSEPORT`、多 size class、`sendFile` | ❌ M3 | 架构提及，代码未落地 |
 | TLS 中间件、AutoProtocol/h2、QUIC | ❌ M4 | 另立设计 |
@@ -139,7 +139,7 @@ pub fn Server(comptime App: type) type {
 1. `r.bufferedLen() == 0` 时才 flush 待发响应——pipelining 下响应在写缓冲累积，一次 vectored syscall 发出。
 2. `conn.waitReadable(keep_alive_timeout)`：可被停机打断的请求边界空闲等待。
 3. `findHeadEnd`：扫 `\r\n\r\n`，按需 `fillMore`；**阻塞 refill 前先 flush 待发响应**，避免对端在排队输出上干等。
-4. `arena.reset(.retain_capacity)` → 把 head 字节 `dupe` 进 arena（见 3.6 为什么要拷）→ `parser.parse` 纯函数解析。
+4. 请求边界按 `max_retained_arena` 重置 arena → 把 head 字节 `dupe` 进 arena（见 3.6 为什么要拷）→ `parser.parse` 纯函数解析。
 5. 构造 `BodyReader`（无 body 的热路径跳过 body buffer）、`Request`、`Response`，调 `app.handle`。
 6. handler 没写响应是契约违反，回 500;有 body 未读完则 `body.discard()` 排空;按协商结果决定 keep-alive 或关连接。
 
@@ -161,7 +161,7 @@ body 侧 `body.zig` 是对称的严格化：chunk size 纯 hex（无 extension�
 
 ### 3.6 内存模型：arena + 借用 + buffer pool
 
-- **每请求 arena**：`Connection.arena` 每请求 `reset(.retain_capacity)`，稳态热路径无 malloc/free。
+- **每请求 arena**：`Connection.arena` 在请求边界使用 `reset(.{ .retain_with_limit = max })`，默认最多保留 64 KiB；配置 `max_retained_arena = null` 时保留高水位。请求需求超过保留量时可能重新分配。
 - **借用切片**：header/target 借用 arena 里的 head 拷贝，生命周期 = 当前请求。
 - **为什么拷一份 head**：header 切片要在 handler 读 body 期间保持有效，而 body 走同一个 `std.Io.Reader`，其缓冲会在 refill 时 rebase。拷几百字节的 head 进 arena，用一次 memcpy 换取生命周期正确性，同时保住零拷贝解析（见 `protocol.zig` 文件头注释）。
 - **BufferPool**（`buffer_pool.zig`）：当前每个池实例单一 size class（server 跑两个池：read 16K = `max_header_size`，write 4K）。临界区 O(1) 无挂起点，用自旋锁而非协程 mutex，保持池与运行时无关。
@@ -173,7 +173,7 @@ body 侧 `body.zig` 是对称的严格化：chunk size 纯 hex（无 extension�
 
 > **不可移动**：reader/writer 的 `std.Io` 接口通过 `@fieldParentPtr` 反查父结构，因此 `Connection` init 后不能移动。必须在连接协程里**原地构造**并传指针（见 `connection.zig` 文件头注释）。同理 `PipeReader`/`BodyReader`/`ChunkedBodyWriter` 都靠 `@fieldParentPtr("interface", ...)` 自指。
 
-`waitReadable` 值得注意：transport 支持 setTimeout 时，用 1s 短超时 tick 轮询 + 中间检查停机标志（与 §5.6 心跳同节奏，M3 由心跳接管唤醒职责）；没有读超时的 transport（内存管道）退化为普通阻塞 `fill(1)`。没有它，空闲 keep-alive 连接只能等 drain-timeout 才死，停机会拖满整个 drain 窗口。
+`waitReadable` 值得注意：transport 支持 setTimeout 时，用 1s 短超时 tick 轮询 + 中间检查停机标志（与 §5.6 心跳同节奏，M3 由心跳接管唤醒职责）；没有读超时的自定义 transport 退化为普通阻塞 `fill(1)`；内存管道已支持超时。没有它，空闲 keep-alive 连接只能等 drain-timeout 才死，停机会拖满整个 drain 窗口。
 
 ### 3.8 内存传输：Pipe + MemoryListener
 

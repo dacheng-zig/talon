@@ -4,6 +4,7 @@
 
 test {
     _ = @import("http_server_test.zig");
+    _ = @import("limits_test.zig");
     _ = @import("http_client_test.zig");
     _ = @import("http_client_tls_test.zig");
     _ = @import("stream_server_test.zig");

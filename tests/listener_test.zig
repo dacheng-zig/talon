@@ -52,7 +52,7 @@ test "MemoryListener: connect/accept round-trip in both directions" {
     try std.testing.expect(!group.hasFailed());
 }
 
-test "MemoryListener: close unblocks accept with ChannelClosed" {
+test "MemoryListener: close unblocks accept with Closed" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
 
@@ -61,7 +61,7 @@ test "MemoryListener: close unblocks accept with ChannelClosed" {
 
     const Fns = struct {
         fn acceptor(l: *MemoryListener) !void {
-            try std.testing.expectError(error.ChannelClosed, l.accept());
+            try std.testing.expectError(error.Closed, l.accept());
         }
         fn closer(l: *MemoryListener) !void {
             try zio.sleep(.fromMilliseconds(10));

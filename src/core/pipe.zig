@@ -30,13 +30,21 @@ pub const Pipe = struct {
     /// Returns 0 on end-of-stream (write end closed and buffer drained,
     /// or own read end closed).
     pub fn read(self: *Pipe, dest: []u8) ReadError!usize {
+        return self.readTimeout(dest, .none) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    pub fn readTimeout(self: *Pipe, dest: []u8, timeout: zio.Timeout) (ReadError || error{Timeout})!usize {
+        const deadline = timeout.toDeadline();
         if (dest.len == 0) return 0;
         try self.mutex.lock();
         defer self.mutex.unlock();
 
         while (self.count == 0) {
             if (self.write_closed or self.read_closed) return 0;
-            try self.readable.wait(&self.mutex);
+            try self.readable.waitTimeout(&self.mutex, deadline);
         }
 
         const n = @min(dest.len, self.count);
@@ -52,6 +60,14 @@ pub const Pipe = struct {
     /// Writes up to src.len bytes, suspending while the pipe is full.
     /// Returns the number of bytes written (at least 1 on success).
     pub fn write(self: *Pipe, src: []const u8) WriteError!usize {
+        return self.writeTimeout(src, .none) catch |err| switch (err) {
+            error.Timeout => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    pub fn writeTimeout(self: *Pipe, src: []const u8, timeout: zio.Timeout) (WriteError || error{Timeout})!usize {
+        const deadline = timeout.toDeadline();
         if (src.len == 0) return 0;
         try self.mutex.lock();
         defer self.mutex.unlock();
@@ -59,7 +75,7 @@ pub const Pipe = struct {
         while (true) {
             if (self.read_closed or self.write_closed) return error.BrokenPipe;
             if (self.count < self.buffer.len) break;
-            try self.writable.wait(&self.mutex);
+            try self.writable.waitTimeout(&self.mutex, deadline);
         }
 
         const n = @min(src.len, self.buffer.len - self.count);
@@ -77,6 +93,12 @@ pub const Pipe = struct {
         while (offset < src.len) {
             offset += try self.write(src[offset..]);
         }
+    }
+
+    /// A duration limits each wait for progress; a deadline bounds the whole transfer.
+    pub fn writeAllTimeout(self: *Pipe, src: []const u8, timeout: zio.Timeout) (WriteError || error{Timeout})!void {
+        var offset: usize = 0;
+        while (offset < src.len) offset += try self.writeTimeout(src[offset..], timeout);
     }
 
     /// Closes the write end. Pending readers drain buffered bytes, then see EOF.
@@ -103,7 +125,12 @@ pub const Pipe = struct {
 pub const PipeReader = struct {
     pipe: *Pipe,
     interface: std.Io.Reader,
-    err: ?ReadError = null,
+    err: ?(ReadError || error{Timeout}) = null,
+    timeout: zio.Timeout = .none,
+
+    pub fn setTimeout(self: *PipeReader, timeout: zio.Timeout) void {
+        self.timeout = timeout;
+    }
 
     pub fn init(pipe: *Pipe, buffer: []u8) PipeReader {
         return .{
@@ -120,7 +147,7 @@ pub const PipeReader = struct {
     fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *PipeReader = @alignCast(@fieldParentPtr("interface", io_r));
         const dest = limit.slice(try io_w.writableSliceGreedy(1));
-        const n = self.pipe.read(dest) catch |err| {
+        const n = self.pipe.readTimeout(dest, self.timeout) catch |err| {
             self.err = err;
             return error.ReadFailed;
         };
@@ -134,7 +161,12 @@ pub const PipeReader = struct {
 pub const PipeWriter = struct {
     pipe: *Pipe,
     interface: std.Io.Writer,
-    err: ?WriteError = null,
+    err: ?(WriteError || error{Timeout}) = null,
+    timeout: zio.Timeout = .none,
+
+    pub fn setTimeout(self: *PipeWriter, timeout: zio.Timeout) void {
+        self.timeout = timeout;
+    }
 
     pub fn init(pipe: *Pipe, buffer: []u8) PipeWriter {
         return .{
@@ -151,7 +183,7 @@ pub const PipeWriter = struct {
         const buffered = io_w.buffered();
         var total: usize = 0;
 
-        self.pipe.writeAll(buffered) catch |err| {
+        self.pipe.writeAllTimeout(buffered, self.timeout) catch |err| {
             self.err = err;
             return error.WriteFailed;
         };
@@ -159,7 +191,7 @@ pub const PipeWriter = struct {
 
         if (data.len > 0) {
             for (data[0 .. data.len - 1]) |slice| {
-                self.pipe.writeAll(slice) catch |err| {
+                self.pipe.writeAllTimeout(slice, self.timeout) catch |err| {
                     self.err = err;
                     return error.WriteFailed;
                 };
@@ -167,7 +199,7 @@ pub const PipeWriter = struct {
             }
             const last = data[data.len - 1];
             for (0..splat) |_| {
-                self.pipe.writeAll(last) catch |err| {
+                self.pipe.writeAllTimeout(last, self.timeout) catch |err| {
                     self.err = err;
                     return error.WriteFailed;
                 };
@@ -179,6 +211,55 @@ pub const PipeWriter = struct {
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+test "PipeWriter: duration renews on progress but deadline bounds the transfer" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const F = struct {
+        fn consume(p: *Pipe, received: *usize) !void {
+            var bytes: [16]u8 = undefined;
+            while (true) {
+                try zio.sleep(.fromMilliseconds(20));
+                const n = try p.read(&bytes);
+                if (n == 0) return;
+                for (bytes[0..n]) |byte| try std.testing.expectEqual(@as(u8, 'x'), byte);
+                received.* += n;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |absolute| {
+        var storage: [32]u8 = undefined;
+        var pipe = Pipe.init(&storage);
+        var received: usize = 0;
+        var task = try zio.spawn(F.consume, .{ &pipe, &received });
+        var joined = false;
+        defer if (!joined) {
+            pipe.closeWrite();
+            task.cancel();
+            task.join() catch {};
+        };
+        var buffer: [64]u8 = undefined;
+        var writer = PipeWriter.init(&pipe, &buffer);
+        const timeout: zio.Timeout = .fromMilliseconds(200);
+        writer.setTimeout(if (absolute) timeout.toDeadline() else timeout);
+        const payload = [_]u8{'x'} ** 512;
+        if (absolute) {
+            try std.testing.expectError(error.WriteFailed, writer.interface.writeAll(&payload));
+            try std.testing.expectEqual(error.Timeout, writer.err.?);
+        } else {
+            try writer.interface.writeAll(&payload);
+            try writer.interface.flush();
+        }
+        pipe.closeWrite();
+        joined = true;
+        try task.join();
+        if (absolute) {
+            try std.testing.expect(received < payload.len);
+        } else {
+            try std.testing.expectEqual(payload.len, received);
+        }
+    }
+}
 
 test "Pipe: write then read round-trips bytes" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});

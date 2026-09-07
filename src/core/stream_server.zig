@@ -72,6 +72,9 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         };
 
         pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Self {
+            if (options.limits.min_body_data_rate) |rate| {
+                if (rate.bytes_per_sec == 0 or rate.grace.toNanoseconds() == 0) return error.InvalidDataRate;
+            }
             var read_pool = try BufferPool.init(gpa, .{
                 // Slack over max_header_size so the head scanner trips its
                 // "> max_header_size" guard before the buffer fills — sizing
@@ -254,7 +257,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
                     ConnChain.run(&conn, ProtoTerminal{ .app = server.app }) catch |err| switch (err) {
                         // Routine connection terminations (cancel during
                         // drain, peer reset/timeout) are not server faults.
-                        error.Canceled, error.ReadFailed, error.WriteFailed, error.EndOfStream => {},
+                        error.Canceled, error.ReadFailed, error.WriteFailed, error.EndOfStream, error.BodyTooSlow => {},
                         else => log.warn("connection handler error: {t} (peer: {f})", .{ err, raw.remoteInfo() }),
                     };
                 }

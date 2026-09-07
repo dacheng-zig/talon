@@ -18,6 +18,7 @@ pub const BodyError = error{
     /// Accumulated body exceeds limits.max_body_size.
     BodyTooLarge,
     ReadFailed,
+    BodyTooSlow,
 };
 
 pub const BodyReader = struct {
@@ -30,6 +31,28 @@ pub const BodyReader = struct {
     interface: std.Io.Reader,
     err: ?BodyError = null,
     chunk_remaining: u64 = 0,
+    /// Optional server policy around network refills (also chunk framing).
+    /// Pure codec users and clients leave this null.
+    read_policy: ?ReadPolicy = null,
+
+    pub const ReadPolicy = struct {
+        ctx: *anyopaque,
+        /// False rejects a refill before it starts.
+        before: *const fn (*anyopaque, u64) bool,
+        /// Called after each attempted refill; true marks a rate violation.
+        after: *const fn (*anyopaque) bool,
+    };
+
+    fn refill(self: *BodyReader) std.Io.Reader.Error!void {
+        if (self.read_policy) |policy| {
+            if (!policy.before(policy.ctx, self.produced)) return self.fail(error.BodyTooSlow);
+        }
+        const result = self.upstream.fillMore();
+        if (self.read_policy) |policy| {
+            if (policy.after(policy.ctx)) return self.fail(error.BodyTooSlow);
+        }
+        try result;
+    }
 
     const State = union(enum) {
         none,
@@ -145,9 +168,9 @@ pub const BodyReader = struct {
                 // clean terminator here (not TruncatedBody).
                 const up = self.upstream;
                 if (up.bufferedLen() == 0) {
-                    up.fillMore() catch |err| switch (err) {
+                    self.refill() catch |err| switch (err) {
                         error.EndOfStream => return error.EndOfStream,
-                        error.ReadFailed => return self.fail(error.ReadFailed),
+                        error.ReadFailed => return self.fail(self.err orelse error.ReadFailed),
                     };
                 }
                 const window = up.buffered();
@@ -203,9 +226,9 @@ pub const BodyReader = struct {
     fn streamFromUpstream(self: *BodyReader, io_w: *std.Io.Writer, limit: std.Io.Limit, cap: u64) std.Io.Reader.StreamError!usize {
         const up = self.upstream;
         if (up.bufferedLen() == 0) {
-            up.fillMore() catch |err| switch (err) {
+            self.refill() catch |err| switch (err) {
                 error.EndOfStream => return self.fail(error.TruncatedBody),
-                error.ReadFailed => return self.fail(error.ReadFailed),
+                error.ReadFailed => return self.fail(self.err orelse error.ReadFailed),
             };
         }
         const window = up.buffered();
@@ -247,10 +270,11 @@ pub const BodyReader = struct {
     }
 
     fn expectCrlf(self: *BodyReader, on_garbage: BodyError) std.Io.Reader.StreamError!void {
-        const pair = self.upstream.take(2) catch |err| switch (err) {
+        while (self.upstream.bufferedLen() < 2) self.refill() catch |err| switch (err) {
             error.EndOfStream => return self.fail(error.TruncatedBody),
-            error.ReadFailed => return self.fail(error.ReadFailed),
+            error.ReadFailed => return self.fail(self.err orelse error.ReadFailed),
         };
+        const pair = self.upstream.take(2) catch unreachable;
         if (!std.mem.eql(u8, pair, "\r\n")) return self.fail(on_garbage);
     }
 
@@ -269,9 +293,9 @@ pub const BodyReader = struct {
                 return line;
             }
             if (window.len > max_line + 2) return self.fail(error.MalformedChunk);
-            up.fillMore() catch |err| switch (err) {
+            self.refill() catch |err| switch (err) {
                 error.EndOfStream => return self.fail(error.TruncatedBody),
-                error.ReadFailed => return self.fail(error.ReadFailed),
+                error.ReadFailed => return self.fail(self.err orelse error.ReadFailed),
             };
         }
     }

@@ -33,8 +33,8 @@ pub fn Connection(comptime Raw: type) type {
         limits: *const Limits,
         shutting_down: *const std.atomic.Value(bool),
         /// Per-connection arena for request-scoped allocations; protocols
-        /// reset it between requests (`reset(.retain_capacity)`) so the
-        /// steady-state hot path is malloc-free.
+        /// reset it between requests. HTTP caps the retained capacity using
+        /// Limits.max_retained_arena to avoid pinning exceptional allocations.
         arena: *std.heap.ArenaAllocator,
         /// Middleware-provided remote identity (e.g. PROXY protocol);
         /// overrides the transport's own when set.
@@ -88,7 +88,7 @@ pub fn Connection(comptime Raw: type) type {
         }
 
         /// Per-read deadline (kernel-level zio Timeout). No-op on transports
-        /// without timeout support (memory pipes) — current limitation.
+        /// without timeout support — current limitation.
         pub fn setReadTimeout(self: *Self, timeout: zio.Timeout) void {
             if (comptime std.meta.hasMethod(Raw.Reader, "setTimeout")) {
                 self.reader_state.setTimeout(timeout);
@@ -124,7 +124,7 @@ pub fn Connection(comptime Raw: type) type {
         ///
         /// On exit the read timeout is reset to .none; set your own deadline
         /// before the next read. On transports without read timeouts
-        /// (memory pipes) this is a plain blocking wait.
+        /// this is a plain blocking wait.
         pub fn waitReadable(self: *Self, budget: zio.Timeout) WaitReadableError!void {
             if (self.isShuttingDown()) return error.ShuttingDown;
 
@@ -137,9 +137,12 @@ pub fn Connection(comptime Raw: type) type {
             }
 
             var stopwatch = zio.Stopwatch.start();
+            const deadline = budget.toDeadline();
             defer self.setReadTimeout(.none);
             while (true) {
-                self.setReadTimeout(.{ .duration = idle_poll_tick });
+                const tick = zio.Timeout{ .duration = idle_poll_tick };
+                const next_tick = tick.toDeadline();
+                self.setReadTimeout(if (deadline == .deadline and deadline.deadline.toNanoseconds() < next_tick.deadline.toNanoseconds()) deadline else next_tick);
                 self.reader_state.interface.fill(1) catch |err| switch (err) {
                     error.EndOfStream => return error.EndOfStream,
                     error.ReadFailed => {
