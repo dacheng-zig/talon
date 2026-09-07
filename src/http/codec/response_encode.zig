@@ -71,6 +71,11 @@ pub const EncodeError = error{
     InvalidHeader,
 };
 
+pub fn statusAllowsBody(status: Status) bool {
+    const code = @intFromEnum(status);
+    return code >= 200 and code != 204 and code != 205 and code != 304;
+}
+
 /// Prints the status line + standard headers + extra headers + blank line
 /// into `w` (the connection's buffered writer). Does not flush.
 ///
@@ -90,7 +95,12 @@ pub fn writeHead(w: *std.Io.Writer, date: *DateCache, options: HeadOptions) (std
     const code = @intFromEnum(options.status);
     const phrase = options.status.phrase() orelse "";
     try w.print("HTTP/1.1 {d} {s}\r\ndate: {s}\r\n", .{ code, phrase, date.get() });
-    if (options.content_length) |cl| {
+    if (@intFromEnum(options.status) == 205) {
+        try w.writeAll("content-length: 0\r\n");
+    } else if (!statusAllowsBody(options.status)) {
+        // Omit framing for 1xx/204/304. Representation metadata on 304 is
+        // optional; this encoder does not infer it from a discarded body.
+    } else if (options.content_length) |cl| {
         try w.print("content-length: {d}\r\n", .{cl});
     } else if (options.chunked) {
         try w.writeAll("transfer-encoding: chunked\r\n");
@@ -134,6 +144,9 @@ pub const ChunkedBodyWriter = struct {
     out: *std.Io.Writer,
     interface: std.Io.Writer,
     finished: bool = false,
+    /// HEAD and bodyless statuses consume application output without emitting
+    /// payload, chunk framing, or the terminating chunk.
+    suppress_body: bool = false,
 
     pub fn init(out: *std.Io.Writer, buffer: []u8) ChunkedBodyWriter {
         return .{
@@ -151,7 +164,7 @@ pub const ChunkedBodyWriter = struct {
         std.debug.assert(!self.finished);
         try self.interface.flush();
         self.finished = true;
-        try self.out.writeAll("0\r\n\r\n");
+        if (!self.suppress_body) try self.out.writeAll("0\r\n\r\n");
     }
 
     fn drainImpl(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -162,6 +175,7 @@ pub const ChunkedBodyWriter = struct {
         for (data[0..data.len -| 1]) |slice| total += slice.len;
         if (data.len > 0) total += data[data.len - 1].len * splat;
         if (total == 0) return 0;
+        if (self.suppress_body) return io_w.consume(total);
 
         try self.out.print("{x}\r\n", .{total});
         try self.out.writeAll(buffered);

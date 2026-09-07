@@ -25,15 +25,23 @@ pub const Response = struct {
     /// (vectored into a single syscall by the zio writer).
     pub fn respond(self: *Response, body: []const u8, options: RespondOptions) !void {
         std.debug.assert(!self.written);
-        self.written = true;
+        // Informational responses cannot terminate a handler's response.
+        // Protocol upgrades use Request.upgrade instead.
+        if (@intFromEnum(options.status) < 200) return error.InvalidStatus;
         if (!options.keep_alive) self.keep_alive = false;
-        try encode.writeHead(self.out, self.date, .{
+        encode.writeHead(self.out, self.date, .{
             .status = options.status,
             .extra_headers = options.extra_headers,
-            .content_length = body.len,
+            .content_length = if (encode.statusAllowsBody(options.status)) body.len else null,
             .keep_alive = self.keep_alive,
-        });
-        if (!self.suppress_body) {
+        }) catch |err| {
+            // Validation happens before output. A transport failure can leave
+            // a partial head, so it must never be followed by a fallback 500.
+            if (err != error.InvalidHeader) self.written = true;
+            return err;
+        };
+        self.written = true;
+        if (!self.suppress_body and encode.statusAllowsBody(options.status)) {
             try self.out.writeAll(body);
         }
     }
@@ -47,15 +55,23 @@ pub const Response = struct {
         buffer: []u8,
     ) !encode.ChunkedBodyWriter {
         std.debug.assert(!self.written);
-        self.written = true;
+        if (@intFromEnum(options.status) < 200) return error.InvalidStatus;
         if (!options.keep_alive) self.keep_alive = false;
-        try encode.writeHead(self.out, self.date, .{
+        encode.writeHead(self.out, self.date, .{
             .status = options.status,
             .extra_headers = options.extra_headers,
             .chunked = true,
             .keep_alive = self.keep_alive,
-        });
-        return encode.ChunkedBodyWriter.init(self.out, buffer);
+        }) catch |err| {
+            // Validation happens before output. A transport failure can leave
+            // a partial head, so it must never be followed by a fallback 500.
+            if (err != error.InvalidHeader) self.written = true;
+            return err;
+        };
+        self.written = true;
+        var body_writer = encode.ChunkedBodyWriter.init(self.out, buffer);
+        body_writer.suppress_body = self.suppress_body or !encode.statusAllowsBody(options.status);
+        return body_writer;
     }
 
     /// Opens a Server-Sent Events stream: a chunked response carrying the SSE

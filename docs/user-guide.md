@@ -376,3 +376,5 @@ HTTP 服务默认启用以下限制，可通过 `Server.init` 的 `limits` 配�
 - `max_retained_arena`：每次请求结束后保留的 arena 容量上限，默认 64 KiB。它限制请求之间的保留量，不限制 handler 的峰值分配；`null` 保留高水位，`0` 全部释放。超出保留上限的工作负载可能在后续请求重新分配。
 
 TCP 和内存管道都支持读写超时。自定义传输若没有 `setTimeout` 方法，必须自行提供等价的等待限制；引擎无法替它中断阻塞读取。
+
+HEAD 的固定长度、chunked 和 SSE 响应只输出响应头。204、205、304 不输出正文；1xx 不能作为 `respond` / `startChunked` 的最终状态，升级应使用专门的 upgrade API。

@@ -91,7 +91,7 @@ pub fn Http1Protocol(comptime App: type) type {
                 const head_len = head_scan.findHeadEnd(r, conn.limits.max_header_size, w) catch |err| switch (err) {
                     error.CleanClose => return,
                     error.HeadersTooLarge => {
-                        return respondErrorAndClose(w, &date_cache, .request_header_fields_too_large);
+                        return respondErrorAndClose(w, &date_cache, .request_header_fields_too_large, false);
                     },
                     else => return, // truncated head / read failure / timeout
                 };
@@ -100,16 +100,16 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 // Pin the head for the request's lifetime (see file doc).
                 const head_bytes = arena.dupe(u8, r.buffered()[0..head_len]) catch
-                    return respondErrorAndClose(w, &date_cache, .internal_server_error);
+                    return respondErrorAndClose(w, &date_cache, .internal_server_error, false);
                 r.toss(head_len);
 
                 const head = parser.parse(head_bytes, &headers_storage) catch |err| {
-                    return respondErrorAndClose(w, &date_cache, statusForParseError(err));
+                    return respondErrorAndClose(w, &date_cache, statusForParseError(err), false);
                 };
 
                 if (head.content_length) |cl| {
                     if (conn.limits.max_body_size) |max| {
-                        if (cl > max) return respondErrorAndClose(w, &date_cache, .payload_too_large);
+                        if (cl > max) return respondErrorAndClose(w, &date_cache, .payload_too_large, head.method == .HEAD);
                     }
                 }
 
@@ -117,7 +117,7 @@ pub fn Http1Protocol(comptime App: type) type {
                 const has_body = head.transfer_chunked or (head.content_length orelse 0) != 0;
                 const body_buffer: []u8 = if (has_body)
                     arena.alloc(u8, body_buffer_size) catch
-                        return respondErrorAndClose(w, &date_cache, .internal_server_error)
+                        return respondErrorAndClose(w, &date_cache, .internal_server_error, head.method == .HEAD)
                 else
                     &empty_body_buffer;
                 var body = body_mod.BodyReader.init(r, &head, conn.limits.max_body_size, body_buffer);
@@ -154,7 +154,7 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 app.handle(&req, &res) catch |err| {
                     if (!res.written) {
-                        respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req)) catch {};
+                        respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req), head.method == .HEAD) catch {};
                     } else {
                         w.flush() catch {};
                     }
@@ -168,7 +168,14 @@ pub fn Http1Protocol(comptime App: type) type {
 
                 if (!res.written) {
                     // Handler contract violation: never leave the client hanging.
-                    return respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req));
+                    return respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req), head.method == .HEAD);
+                }
+
+                // A closing response need not drain an upload the application
+                // rejected; publish it promptly instead of waiting for the peer.
+                if (!res.keep_alive or conn.isShuttingDown()) {
+                    w.flush() catch {};
+                    return;
                 }
 
                 // Drain unread body so the next request parses cleanly; a
@@ -213,14 +220,15 @@ fn statusForParseError(err: parser.ParseError) Status {
 
 /// Minimal error response; the connection is closed afterwards by the
 /// caller returning out of the connection loop.
-fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Status) anyerror!void {
+fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Status, suppress_body: bool) anyerror!void {
     const phrase = status.phrase() orelse "Error";
     encode.writeHead(w, date, .{
         .status = status,
         .content_length = phrase.len,
         .keep_alive = false,
     }) catch return;
-    w.writeAll(phrase) catch return;
+    // HEAD semantics apply to protocol-generated errors as well as app output.
+    if (!suppress_body) w.writeAll(phrase) catch return;
     w.flush() catch return;
 }
 
