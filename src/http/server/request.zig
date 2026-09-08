@@ -1,7 +1,8 @@
 //! Request type.
 //!
 //! Header/target slices borrow the per-request arena copy of the head;
-//! their lifetime is the current request — dupe with `req.arena` to escape.
+//! their lifetime is the current request. To retain them after the request,
+//! dupe with a longer-lived allocator and free through that allocator.
 
 const std = @import("std");
 const zio = @import("zio");

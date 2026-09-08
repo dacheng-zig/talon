@@ -5,14 +5,17 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zio = .{
-            .path = "../zio",
+            .url = "https://codeload.github.com/lalinsky/zio/tar.gz/34510ecd0e41192eb4d379a047226269c4a1a56f",
+            .hash = "zio-0.17.0-xHbVVJRBKQDIlz7hLibEGv0nV8F4Aj_J4HTtgDmDF1V4",
         },
     },
     .paths = .{
+        "README.md",
         "build.zig",
         "build.zig.zon",
         "src",
         "examples",
+        "tests",
         "docs",
     },
 }
