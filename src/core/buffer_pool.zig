@@ -1,8 +1,9 @@
 //! Buffer pool.
 //!
 //! One size class per pool instance (the server runs one pool per
-//! purpose: read 16K, write 4K). A future 4K/16K/64K three-tier free-list
-//! extends this — the API is already per-size so that lands without churn.
+//! purpose: read 17 KiB by default, write 4 KiB). A future 4K/16K/64K
+//! three-tier free-list extends this — the API is already per-size so that
+//! lands without churn.
 //!
 //! Debug borrow tracking (Netty ResourceLeakDetector lesson, lightweight):
 //! in Debug builds each rented buffer records its borrow site via
@@ -17,9 +18,10 @@ const track_borrows = builtin.mode == .Debug;
 
 const log = std.log.scoped(.talon);
 
-/// The critical sections are O(1) with no suspension points, so a spin lock
-/// is cheaper than a coroutine mutex and keeps the pool runtime-agnostic.
-/// Shared with the client connection pool, which has the same discipline.
+/// Runtime-agnostic lock shared with the client connection pool. Protected
+/// operations include allocation, freeing and container growth; they are not
+/// uniformly O(1). Allocators used under this lock must not suspend, and
+/// multi-executor contention needs measurement.
 pub const SpinLock = struct {
     state: std.atomic.Mutex = .unlocked,
 

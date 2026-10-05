@@ -61,8 +61,8 @@ pub fn Connection(comptime Raw: type) type {
             };
         }
 
-        /// Buffered reader over the connection (post-middleware once the
-        /// connection middleware chain is implemented).
+        /// Buffered reader over the connection. Middleware and protocols share
+        /// this reader; middleware may consume a preamble before calling next.
         pub fn reader(self: *Self) *std.Io.Reader {
             return &self.reader_state.interface;
         }
@@ -117,9 +117,8 @@ pub fn Connection(comptime Raw: type) type {
         /// `budget` elapses.
         ///
         /// Implemented as short kernel-timeout read ticks with a shutdown
-        /// check in between — the same 1s cadence as the heartbeat,
-        /// which will take over the wakeup duty once implemented. Without this, idle
-        /// keep-alive connections only die via the drain-timeout cancel,
+        /// check in between at a 1s cadence; no background heartbeat is used.
+        /// Without this, idle keep-alive connections only die via drain-timeout cancel,
         /// making shutdown take the full drain window.
         ///
         /// On exit the read timeout is reset to .none; set your own deadline

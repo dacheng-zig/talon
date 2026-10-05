@@ -1,6 +1,6 @@
 # talon：基于 zio 的网络服务引擎架构设计
 
-本文说明当前实现的边界、设计取舍及尚未实现的演进方向。操作入口见 [使用指南](user-guide.md)，实现细节与测试位置见 [开发者指南](developer-guide.md)。适用依赖以 [build.zig.zon](../build.zig.zon) 为准：Zig 最低版本 0.16.0，zio 固定提交 `34510ecd0e41192eb4d379a047226269c4a1a56f`。
+本文说明当前实现的边界、设计取舍及尚未实现的演进方向。操作入口见 [使用指南](user-guide.md)，实现细节与测试位置见 [开发者指南](developer-guide.md)。适用依赖以 [build.zig.zon](../build.zig.zon) 为准：当前使用 Zig 0.16.0，zio 使用 v0.18.0 版本归档并校验包哈希；最低 Zig 版本声明不代表已验证后续版本兼容性。
 
 早期设计以 M0→M4 描述路线图；当前已包含客户端 TLS、SSE、WebSocket 和资源限制，不能再用“仅实现 M1”概括。本文的规划不构成现有 API、发布日期或验收通过记录。wing 是独立项目，本仓库没有 `wing-architecture.md`。
 

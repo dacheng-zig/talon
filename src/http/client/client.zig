@@ -529,7 +529,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                     error.WriteFailed => return error.OutOfMemory,
                 };
                 if (aw.written().len > max_decoded) return error.ResponseTooLarge;
-                return std.json.parseFromSlice(T, gpa, aw.written(), .{});
+                return std.json.parseFromSlice(T, gpa, aw.written(), .{ .allocate = .alloc_always });
             }
 
             /// Drains any unread body (so the transport ends cleanly) and hands
@@ -595,7 +595,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         }
 
         /// Runs `reapIdle` every `interval` until canceled — the proactive idle
-        /// reaper (dual of the server's heartbeat). Spawn it into the same
+        /// reaper. Spawn it into the same
         /// `zio.Group` that owns the Client; canceling the group ends the loop:
         ///   try group.spawn(Client.reapLoop, .{ &client, .fromSeconds(30) });
         pub fn reapLoop(self: *Self, interval: zio.Duration) void {

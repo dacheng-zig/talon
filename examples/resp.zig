@@ -1,8 +1,8 @@
 //! RESP echo server using only `talon.core` — a non-HTTP protocol on the bare
 //! engine contract: listener, connection limits, graceful shutdown, framing
 //! toolbox, with zero use of talon's HTTP layer. The
-//! core-compiles-without-http guarantee is enforced by the isolated core test
-//! build in build.zig.
+//! example uses only talon.core; build.zig builds it through the single talon
+//! module and does not provide an isolated core test target.
 //!
 //! Line handling rides framing.Delimited instead of hand-rolled
 //! delimiter scanning. Speaks RESP inline commands; try:

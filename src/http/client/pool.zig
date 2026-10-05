@@ -4,7 +4,7 @@
 //! accept-loop: where the server pools idle *buffers*, the client pools idle
 //! *connections*.
 //!
-//! Design (mirrors `docs/talon-client-architecture.md §6`):
+//! Design (see `docs/developer-guide.md §7`):
 //!   - Keyed by origin = scheme://host:port; each origin owns an idle free-list.
 //!   - Two independent eviction knobs (the .NET lesson):
 //!       * `connection_lifetime` — max age since the transport was established
@@ -23,12 +23,11 @@
 //!     `zio.Semaphore` (the undici unbounded-connections footgun fix); the idle
 //!     caps bound retained connections independently.
 //!
-//! Concurrency: the free-list mutations are O(1) with no suspension points, so
-//! the same `SpinLock` the buffer pool uses fits here — dialing, the liveness
-//! probe, and connection destroy all happen strictly outside the lock. Stat
-//! counters are atomic so observability never contends with the critical
-//! section. The in-flight semaphore's wait/post likewise suspend outside the
-//! lock (only its lazy creation is under it).
+//! Concurrency: the same `SpinLock` as the buffer pool protects map/free-list
+//! state, including allocation, freeing and container growth. Allocators used
+//! under it must not suspend; critical-section cost and contention need
+//! measurement. Dialing, liveness probes, connection destruction and semaphore
+//! waits happen outside the lock. Stat counters are atomic.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -289,7 +288,7 @@ pub fn Pool(comptime Connector: type) type {
         }
 
         /// Proactively closes idle connections past their lifetime/idle
-        /// deadline (the dual of the server's heartbeat sweep), so idle fds are
+        /// deadline, so idle fds are
         /// reclaimed without waiting for the next checkout. Returns the count
         /// reaped. Safe to call concurrently with checkout/checkin. Spawn
         /// `Client.reapLoop` into a Group to run this on a cadence.

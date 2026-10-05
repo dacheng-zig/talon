@@ -16,7 +16,7 @@ talon 是基于 [zio](https://github.com/lalinsky/zio) 协程运行时的网络�
 ## 1. 前置条件
 
 - Zig `0.16.0`（`build.zig.zon` 中 `minimum_zig_version = "0.16.0"`）。
-- 依赖 zio 运行时。`build.zig.zon` 已固定到提交 `34510ecd0e41192eb4d379a047226269c4a1a56f`（zio 0.17.0），并校验包哈希；首次构建会自动下载，无需相邻的 zio 仓库。
+- 依赖 zio 运行时。[build.zig.zon](../build.zig.zon) 使用 zio v0.18.0 版本归档，并校验包哈希；首次构建会自动下载，无需相邻的 zio 仓库。
 - 开发 zio 本地改动时可用 `zig build --fork=../zio` 临时覆盖。去掉 `--fork` 即恢复固定依赖；提交 talon 改动前应使用固定依赖验证。
 
 > talon 刻意绑定 zio 原生能力（per-op 超时、`Group` 结构化并发与取消机制），不能跑在其他 `std.Io` 运行时上。对外暴露的 reader/writer 仍是标准 `std.Io.Reader/Writer` 接口。
