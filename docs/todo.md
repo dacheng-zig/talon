@@ -1,10 +1,22 @@
-# 待办与演进方向
+# 维护约束
 
-当前实现与未实现能力以 [架构设计](talon-architecture.md#11-实施路线图talon-侧) 和 [开发者指南](developer-guide.md) 为准。本页只索引已有规划，不表示排期或新增实现承诺。
+当前实现和责任边界见 [架构](talon-architecture.md)。演进由实际消费者及回归证据决定，不维护按阶段推测的功能路线图。
 
-- core：完整劫持资源转移、feature 查询、Unix listener、指标与生命周期钩子。
-- 传输与性能：SO_REUSEPORT、多规格 buffer pool、sendFile。
-- UDP：DatagramServer 与 SessionTable，由真实协议需求驱动。
-- HTTP：服务端 TLS 中间件、AutoProtocol / HTTP/2，后续 QUIC / HTTP/3 另行设计。
+## 当前验证与发布工作
 
-HTTP/HTTPS 客户端、SSE/WebSocket、body 速率防御、写入超时与 arena 保留限制已经实现，不再属于上述待办。性能和长稳验收须以执行记录为依据。
+完整依据、优先级及完成条件见 [项目现状与生产级差距](project-status.md)。以下不承诺新增协议或框架功能：
+
+- [ ] P0：建立声明支持平台的原生 CI；Linux 专项与真实 TLS 验收不能由本机 skip 代替。
+- [ ] P0：按真实消费者验证容量、预算、慢客户端、过载、取消/停机恢复与长稳资源收敛。
+- [ ] P0：将 TLS vendor 完整差异、身份正反例与支持的 OpenSSL 版本验证纳入升级流程。
+- [ ] P1：补 Host authority、未知 Expect、URI 相对重定向的契约与互操作回归。
+- [ ] P1：明确 Cookie 子集和容量、解码后流式预算及应用目标地址政策。
+- [ ] P1：完成请求级监控/排障、应用部署/停机演练、项目许可及 API/安全发布约定。
+- [ ] P2：依据多 executor 争用证据优化锁与缓存，扩展独立互操作和持续 fuzz。
+
+## 持续维护约束
+
+- 升级 Zig 时完整核验 TLS 兼容源码并运行 DNS/IP 身份验收。
+- 改动 allocator、池或协议期限时验证取消、部分初始化及资源守恒。
+- 为新能力添加设计前，先确认现有 Proto/adapter/Connector 边界是否已经足够。
+- 公平性、长期驻留和跨平台性能结论需要相应运行证据，短时 bench 不能替代。
