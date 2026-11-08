@@ -1,4 +1,4 @@
-//! Client-side TLS over the std library `std.crypto.tls.Client`, wired as a
+//! Client-side TLS over a fixed std TLS Client compatibility source, wired as a
 //! `RawConnection` the `ClientConnection` consumes — the "synchronous facade
 //! over coroutines" model (Go's, not Rust's sans-I/O): zio gives the TLS client
 //! a real `std.Io.Reader`/`Writer` over the socket, and the handshake's
@@ -10,26 +10,28 @@
 //! client via `@fieldParentPtr` — so the client must never move after the
 //! handshake, and the two directions cannot be split into the independent
 //! value-type reader/writer the plain transport contract assumes. We therefore
-//! heap-pin one `State` per connection holding the socket, the encrypted-side
-//! zio reader/writer (the TLS record transport), the TLS client, and all four
-//! record buffers, and expose pinned `*std.Io.Reader`/`*std.Io.Writer` via the
+//! heap-pin one `State` per connection holding the socket and raw-side
+//! zio reader/writer. HTTPS allocates a larger owner that embeds this raw state
+//! alongside the TLS client and its plaintext buffers, still in one allocation.
+//! Both expose pinned `*std.Io.Reader`/`*std.Io.Writer` via the
 //! `pinned_transport` marker `ClientConnection` keys on.
 //!
 //! A `TlsConnector` dials either scheme: `https` upgrades to TLS, `http` stays
 //! plaintext (so a client built for TLS still follows an https→http redirect).
 //!
-//! Scope: client only. Server-side HTTPS needs a TLS *server* (absent from std)
-//! and is out of scope. TLS over the in-process MemoryConnector is not provided
-//! — TLS rides TCP here.
+//! This module is client-only; optional server-side TLS lives in talon_tls.
+//! TLS over the in-process MemoryConnector is not provided — TLS rides TCP here.
 
 const std = @import("std");
 const zio = @import("zio");
 const connector_mod = @import("connector.zig");
 const listener_mod = @import("../../core/listener.zig");
+const dial_mod = @import("../../core/dial.zig");
 
 pub const Origin = connector_mod.Origin;
 
-const TlsClient = std.crypto.tls.Client;
+const TlsClient = @import("vendor/tls_client.zig");
+const identity = @import("tls_identity.zig");
 /// The std TLS client asserts its *encrypted-side* input reader has at least
 /// this much buffer (one max-size ciphertext record). We size every record
 /// buffer to it for uniformity and head-scan headroom.
@@ -61,12 +63,12 @@ pub const RootStore = struct {
 };
 
 /// How the server certificate is verified. Defaults exist for testing, but the
-/// production path is `.system` (full host + CA verification).
+/// production path is `.system` (full target identity + CA verification).
 pub const Verification = union(enum) {
-    /// Verify the host name (SNI + match) against the certificate AND the chain
-    /// against the OS trust store. The secure default.
+    /// Verify DNS name or IP SAN identity AND the chain against RootStore
+    /// (normally loaded from the OS). Only DNS names are sent as SNI.
     system: *RootStore,
-    /// Verify the host name, but accept any otherwise-valid self-signed
+    /// Verify DNS name or IP SAN, but accept any otherwise-valid self-signed
     /// certificate (no chain-of-trust). Test/dev only.
     self_signed,
     /// No host and no CA verification — a trusted session cannot be established.
@@ -87,22 +89,23 @@ pub const TlsConnector = struct {
     pub const RawConnection = TlsTransport;
 
     pub fn connect(self: TlsConnector, origin: Origin, timeout: zio.Timeout) !TlsTransport {
-        return switch (origin.scheme) {
-            .http => TlsTransport.connectPlain(self.gpa, origin, timeout),
-            .https => TlsTransport.connectTls(self.gpa, self.io, self.verification, origin, timeout),
+        const deadline = timeout.toDeadline();
+        const raw = try switch (origin.scheme) {
+            .http => TlsTransport.connectPlain(self.gpa, origin, deadline),
+            .https => TlsTransport.connectTls(self.gpa, self.io, self.verification, origin, deadline),
         };
+        errdefer raw.close();
+        try zio.checkCancel();
+        if (deadline == .deadline and
+            zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline.deadline.toNanoseconds())
+            return error.Timeout;
+        return raw;
     }
 };
 
 fn connectTcp(origin: Origin, timeout: zio.Timeout) !zio.net.Stream {
-    if (numericAddress(origin)) |address| {
-        return zio.net.tcpConnectToAddress(address, .{ .timeout = timeout });
-    }
-    return zio.net.tcpConnectToHost(origin.host, origin.port, .{ .timeout = timeout });
-}
-
-fn numericAddress(origin: Origin) ?zio.net.IpAddress {
-    return zio.net.IpAddress.parseIp(origin.host, origin.port) catch null;
+    const raw = try dial_mod.TcpDialer.dial(.{}, .{ .host = origin.host, .port = origin.port }, timeout);
+    return raw.stream;
 }
 
 // ── Transport ────────────────────────────────────────────────────────────────
@@ -128,14 +131,19 @@ pub const TlsTransport = struct {
         tcp_reader: zio.net.Stream.Reader,
         tcp_writer: zio.net.Stream.Writer,
         /// The TLS session; null in plaintext mode.
-        tls: ?TlsClient,
+        tls: ?*TlsState,
         // Record buffers (one max ciphertext record each, uniform for safety):
         //   enc_read  — encrypted bytes the TLS client pulls from the socket
         //   enc_write — encrypted bytes the TLS client pushes to the socket
-        //   dec_read  — decrypted plaintext the HTTP layer reads (TLS only)
-        //   clear_write — plaintext the HTTP layer writes before encryption (TLS only)
         enc_read_buf: [record_buf_len]u8 = undefined,
         enc_write_buf: [record_buf_len]u8 = undefined,
+    };
+
+    /// HTTPS-only state. Its client and buffers stay at their final addresses
+    /// until TLS ending and raw flush are complete.
+    const TlsState = struct {
+        raw: State,
+        client: TlsClient,
         dec_read_buf: [record_buf_len]u8 = undefined,
         clear_write_buf: [record_buf_len]u8 = undefined,
     };
@@ -147,6 +155,11 @@ pub const TlsTransport = struct {
 
     fn allocState(gpa: std.mem.Allocator, stream: zio.net.Stream) !*State {
         const state = try gpa.create(State);
+        initState(state, gpa, stream);
+        return state;
+    }
+
+    fn initState(state: *State, gpa: std.mem.Allocator, stream: zio.net.Stream) void {
         state.* = .{
             .gpa = gpa,
             .stream = stream,
@@ -157,12 +170,10 @@ pub const TlsTransport = struct {
         // Wire the encrypted-side reader/writer at their final pinned addresses.
         state.tcp_reader = stream.reader(&state.enc_read_buf);
         state.tcp_writer = stream.writer(&state.enc_write_buf);
-        return state;
     }
 
     fn connectPlain(gpa: std.mem.Allocator, origin: Origin, timeout: zio.Timeout) !TlsTransport {
         const stream = try connectTcp(origin, timeout);
-        stream.socket.setNoDelay(true) catch {};
         const state = allocState(gpa, stream) catch |err| {
             stream.close();
             return err;
@@ -178,11 +189,12 @@ pub const TlsTransport = struct {
         timeout: zio.Timeout,
     ) !TlsTransport {
         const stream = try connectTcp(origin, timeout);
-        stream.socket.setNoDelay(true) catch {};
         errdefer stream.close();
 
-        const state = try allocState(gpa, stream);
-        errdefer gpa.destroy(state);
+        const tls = try gpa.create(TlsState);
+        errdefer gpa.destroy(tls);
+        const state = &tls.raw;
+        initState(state, gpa, stream);
 
         // The connect timeout also bounds the handshake's socket I/O.
         state.tcp_reader.setTimeout(timeout);
@@ -193,7 +205,7 @@ pub const TlsTransport = struct {
 
         const host: @FieldType(TlsClient.Options, "host") = switch (verification) {
             .insecure_no_verification => .no_verification,
-            .system, .self_signed => .{ .explicit = origin.host },
+            .system, .self_signed => if (identity.Ip.parse(origin.host)) |ip| .{ .ip = ip } else .{ .explicit = origin.host },
         };
         const ca: @FieldType(TlsClient.Options, "ca") = switch (verification) {
             .insecure_no_verification => .no_verification,
@@ -206,12 +218,13 @@ pub const TlsTransport = struct {
             } },
         };
 
-        // errdefers above free `state` and close the socket if the handshake fails.
-        state.tls = try TlsClient.init(&state.tcp_reader.interface, &state.tcp_writer.interface, .{
+        // Publish the TLS state only after successful initialization. Failures
+        // free the enclosing pinned owner and close the socket via errdefer.
+        tls.client = try TlsClient.init(&state.tcp_reader.interface, &state.tcp_writer.interface, .{
             .host = host,
             .ca = ca,
-            .read_buffer = &state.dec_read_buf,
-            .write_buffer = &state.clear_write_buf,
+            .read_buffer = &tls.dec_read_buf,
+            .write_buffer = &tls.clear_write_buf,
             .entropy = &entropy,
             .realtime_now = std.Io.Timestamp.now(io, .real),
             // Forward a bare EOF (peer closed without close_notify, which many
@@ -227,6 +240,7 @@ pub const TlsTransport = struct {
             // application-level length/checksum.
             .allow_truncation_attacks = true,
         });
+        state.tls = tls;
         // Clear the handshake deadline; per-stage timeouts are reapplied per
         // round-trip by the client.
         state.tcp_reader.setTimeout(.none);
@@ -239,14 +253,14 @@ pub const TlsTransport = struct {
     /// The HTTP read stream: the decrypted TLS reader, or the raw socket reader
     /// in plaintext mode.
     pub fn ioReader(self: TlsTransport) *std.Io.Reader {
-        if (self.state.tls) |*c| return &c.reader;
+        if (self.state.tls) |tls| return &tls.client.reader;
         return &self.state.tcp_reader.interface;
     }
 
     /// The HTTP write stream: the plaintext-side TLS writer, or the raw socket
     /// writer in plaintext mode.
     pub fn ioWriter(self: TlsTransport) *std.Io.Writer {
-        if (self.state.tls) |*c| return &c.writer;
+        if (self.state.tls) |tls| return &tls.client.writer;
         return &self.state.tcp_writer.interface;
     }
 
@@ -256,7 +270,7 @@ pub const TlsTransport = struct {
     /// flush must be followed by flushing the encrypted-side socket writer, or
     /// the request never leaves this process.
     pub fn flush(self: TlsTransport) !void {
-        if (self.state.tls) |*c| try c.writer.flush();
+        if (self.state.tls) |tls| try tls.client.writer.flush();
         try self.state.tcp_writer.interface.flush();
     }
 
@@ -297,7 +311,7 @@ pub const TlsTransport = struct {
         const r = &self.state.tcp_reader;
         if (r.interface.bufferedLen() != 0) return false;
         // The decrypted side must also have no buffered plaintext.
-        if (self.state.tls) |*c| if (c.reader.bufferedLen() != 0) return false;
+        if (self.state.tls) |tls| if (tls.client.reader.bufferedLen() != 0) return false;
         r.setTimeout(liveness_probe_timeout);
         defer r.setTimeout(.none);
         _ = r.interface.fill(1) catch |err| switch (err) {
@@ -318,12 +332,12 @@ pub const TlsTransport = struct {
     /// write deadline is set), closes the socket, and frees the pinned state.
     pub fn close(self: TlsTransport) void {
         const state = self.state;
-        if (state.tls) |*c| {
-            c.end() catch {};
+        if (state.tls) |tls| {
+            tls.client.end() catch {};
             state.tcp_writer.interface.flush() catch {};
         }
         state.stream.close();
-        state.gpa.destroy(state);
+        if (state.tls) |tls| state.gpa.destroy(tls) else state.gpa.destroy(state);
     }
 
     /// Half-close the write side (no decrypted-side half-close needed here).
@@ -342,21 +356,10 @@ test "TlsConnector: declares the pinned-transport contract" {
     try std.testing.expect(@hasField(TlsConnector, "verification"));
 }
 
-test "numericAddress recognizes IP literals without resolving hostnames" {
-    const ipv4 = numericAddress(.{ .host = "127.0.0.1", .port = 19091 }).?;
-    try std.testing.expectEqual(zio.net.IpAddress.Family.ipv4, ipv4.getFamily());
-    try std.testing.expectEqual(@as(u16, 19091), ipv4.getPort());
-
-    const ipv6 = numericAddress(.{ .host = "::1", .port = 443 }).?;
-    try std.testing.expectEqual(zio.net.IpAddress.Family.ipv6, ipv6.getFamily());
-    try std.testing.expectEqual(@as(u16, 443), ipv6.getPort());
-
-    try std.testing.expect(numericAddress(.{
-        .host = "example.test",
-        .port = 80,
-    }) == null);
-}
-
 test "record buffers are at least one max ciphertext record" {
     try std.testing.expect(record_buf_len >= std.crypto.tls.max_ciphertext_record_len);
+}
+
+test {
+    _ = identity;
 }

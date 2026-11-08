@@ -8,8 +8,8 @@
 //!      drain) end-to-end without a TLS server (std has none).
 //!   2. Best-effort, real network: an https GET that skips cleanly when the
 //!      sandbox has no egress (NetworkDown / DNS / connect failure) — std has no
-//!      TLS server, so a deterministic in-repo handshake round-trip isn't
-//!      possible; this is the honest coverage of the encrypt/verify path.
+//!      TLS server. Deterministic certificate acceptance is covered separately
+//!      by tests/test_tls_client.py with local certificates and TLS peers.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -51,6 +51,86 @@ test "Verification variants and RootStore default-initialize" {
 }
 
 // ── Deterministic end-to-end over a real TCP server (plaintext via TLS connector)
+
+test "TlsConnector allocation failures close the socket and free partial state" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const Case = struct { scheme: client.Origin.Scheme, fail_index: usize };
+    for ([_]Case{ .{ .scheme = .http, .fail_index = 0 }, .{ .scheme = .https, .fail_index = 0 } }) |case| {
+        var listener = try TcpListener.listen(try zio.net.IpAddress.parseIp4("127.0.0.1", 0), .{});
+        defer listener.close();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = case.fail_index });
+        const F = struct {
+            fn peer(l: *TcpListener) !void {
+                const raw = try l.accept();
+                defer raw.close();
+                var buffer: [1]u8 = undefined;
+                var reader = raw.reader(&buffer);
+                reader.setTimeout(.fromSeconds(2));
+                // No ClientHello is sent before the pinned owner exists.
+                try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
+            }
+            fn connect(io: std.Io, p: u16, gpa: std.mem.Allocator, scheme: client.Origin.Scheme) !void {
+                const connector: client.TlsConnector = .{ .gpa = gpa, .io = io, .verification = .self_signed };
+                try std.testing.expectError(error.OutOfMemory, connector.connect(.{ .scheme = scheme, .host = "127.0.0.1", .port = p }, .fromSeconds(2)));
+            }
+        };
+        var group: zio.Group = .init;
+        defer group.cancel();
+        try group.spawn(F.peer, .{&listener});
+        try group.spawn(F.connect, .{ rt.io(), listener.server.socket.address.ip.getPort(), failing.allocator(), case.scheme });
+        try group.wait();
+        try std.testing.expect(!group.hasFailed());
+        try std.testing.expectEqual(case.fail_index, failing.allocations);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "TlsConnector: stalled handshake obeys the dial deadline and frees pinned state/socket" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var listener = try TcpListener.listen(try zio.net.IpAddress.parseIp4("127.0.0.1", 0), .{});
+    defer listener.close();
+    const port = listener.server.socket.address.ip.getPort();
+    var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var budget = talon.core.AllocationBudget.init(counted.allocator(), 256 * 1024);
+    defer budget.deinit();
+    const F = struct {
+        fn peer(l: *TcpListener) !void {
+            const raw = try l.accept();
+            defer raw.close();
+            var buffer: [1024]u8 = undefined;
+            var reader = raw.reader(&.{});
+            reader.setTimeout(.fromSeconds(2));
+            // Consume ClientHello but never send a TLS reply; EOF proves that
+            // failure closed the dialed socket, rather than only freeing State.
+            var total: usize = 0;
+            while (true) {
+                const n = try reader.interface.readSliceShort(&buffer);
+                if (n == 0) break;
+                total += n;
+            }
+            try std.testing.expect(total > 0);
+        }
+        fn connect(io: std.Io, p: u16, gpa: std.mem.Allocator) !void {
+            const connector: client.TlsConnector = .{ .gpa = gpa, .io = io, .verification = .insecure_no_verification };
+            // The std TLS reader surfaces the underlying socket timeout as
+            // ReadFailed. The public connector preserves that existing error.
+            try std.testing.expectError(error.ReadFailed, connector.connect(.{ .scheme = .https, .host = "127.0.0.1", .port = p }, .fromMilliseconds(100)));
+        }
+    };
+    var group: zio.Group = .init;
+    defer group.cancel();
+    try group.spawn(F.peer, .{&listener});
+    try group.spawn(F.connect, .{ rt.io(), port, budget.allocator() });
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    try std.testing.expect(counted.allocated_bytes > 0);
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().reserved_bytes);
+    try std.testing.expect(budget.stats().peak_reserved_bytes > 0);
+    try std.testing.expect(budget.stats().peak_reserved_bytes <= 256 * 1024);
+}
 
 const HelloApp = struct {
     hits: u32 = 0,
