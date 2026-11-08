@@ -14,6 +14,7 @@ const zio = @import("zio");
 const codec = @import("../codec/codec.zig");
 const flate = std.compress.flate;
 const zstd = std.compress.zstd;
+const timeout_mod = @import("../../core/timeout.zig");
 
 const read_buf_size = 16 * 1024;
 const write_buf_size = 4 * 1024;
@@ -21,6 +22,13 @@ const body_buf_size = 4 * 1024;
 // Strictly below read_buf_size so the head scanner trips its size guard
 // before the read buffer fills (codec/head.zig precondition).
 const max_head_size = read_buf_size - 1024;
+
+/// A logical request owns one budget across informational/final heads,
+/// redirects and retries. null disables only the cumulative byte limit.
+pub const ResponseHeadBudget = struct {
+    pub const default_max_bytes: usize = 64 * 1024;
+    remaining: ?usize = default_max_bytes,
+};
 
 /// Request body source for `sendRequest`. `bytes` is the in-memory fast path;
 /// `reader`/`chunked` stream the body without buffering it — the large-file
@@ -48,9 +56,61 @@ pub const Body = union(enum) {
 /// Pool-owned origin state. References cover both waiters and permit holders;
 /// all reference-count mutations are protected by the pool mutex.
 pub const OriginPermit = struct {
-    sem: zio.Semaphore,
+    active: usize = 0,
     users: usize = 1,
     key: []const u8,
+};
+
+/// Pool-wide decoder allocation reservations. The lock protects accounting
+/// only; allocation and freeing happen outside it. Stable while connections
+/// borrow it, including while idle in the pool.
+pub const DecoderBudget = struct {
+    mutex: @import("../../core/buffer_pool.zig").SpinLock = .{},
+    max_bytes: ?usize,
+    max_idle_bytes: usize,
+    bytes: usize = 0,
+    idle_bytes: usize = 0,
+
+    pub fn reserve(self: *DecoderBudget, n: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const next = std.math.add(usize, self.bytes, n) catch return error.DecoderBudgetExceeded;
+        if (self.max_bytes) |max| if (next > max) return error.DecoderBudgetExceeded;
+        self.bytes = next;
+    }
+
+    pub fn release(self: *DecoderBudget, n: usize, idle: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(n <= self.bytes);
+        self.bytes -= n;
+        if (idle) {
+            std.debug.assert(n <= self.idle_bytes);
+            self.idle_bytes -= n;
+        }
+    }
+
+    pub fn retainIdle(self: *DecoderBudget, n: usize) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(n <= self.bytes - self.idle_bytes);
+        if (n > self.max_idle_bytes -| self.idle_bytes) return false;
+        self.idle_bytes += n;
+        return true;
+    }
+
+    pub fn activate(self: *DecoderBudget, n: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(n <= self.idle_bytes);
+        self.idle_bytes -= n;
+    }
+
+    pub fn snapshot(self: *DecoderBudget) struct { bytes: usize, idle_bytes: usize } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .bytes = self.bytes, .idle_bytes = self.idle_bytes };
+    }
 };
 
 pub fn ClientConnection(comptime Raw: type) type {
@@ -61,20 +121,29 @@ pub fn ClientConnection(comptime Raw: type) type {
         transport: Transport(Raw),
         body_buf: []u8,
         gpa: std.mem.Allocator,
-        /// Pins the response head for the round-trip's lifetime (header slices
-        /// borrow this; valid until `destroy`).
+        /// Pins the response head for the round-trip's lifetime. Header slices
+        /// expire on pool checkin, a new response, or destroy.
         arena: std.heap.ArenaAllocator,
         headers_storage: [codec.response_parser.max_headers]codec.Header = undefined,
         head: codec.response_parser.ResponseHead = undefined,
         body: codec.BodyReader = undefined,
         request_method: codec.Method = .GET,
+        /// Local close intent survives peers that omit Connection: close.
+        request_keep_alive: bool = true,
+        decoder_budget: ?*DecoderBudget = null,
+        decoder_bytes: usize = 0,
+        decoders_idle: bool = false,
         /// Lazily-allocated transparent decoders, reused across round-trips on
-        /// this connection; each is null until a response first needs it, and
-        /// freed on `destroy`. `flate` covers gzip/deflate; `zstd` covers zstd.
+        /// this connection; each is null until a response first needs it.
+        /// Freed on destroy or when idle retention exceeds the shared budget.
+        /// `flate` covers gzip/deflate; `zstd` covers zstd.
         flate_decoder: ?*flate.Decompress = null,
         zstd_decoder: ?*zstd.Decompress = null,
-        /// zstd needs an explicit output window (flate manages its history
-        /// internally). Sized `default_window_len + block_size_max` so any
+        /// The fixed history window makes flate safe for incremental Reader
+        /// operations; zero-window decoding requires an accumulating writer.
+        flate_window: ?[]u8 = null,
+        /// zstd needs an explicit output window. Sized
+        /// `default_window_len + block_size_max` so any
         /// spec-conformant `Content-Encoding: zstd` stream (≤ 8 MiB window)
         /// decodes; lazily allocated on the first zstd response.
         zstd_window: ?[]u8 = null,
@@ -86,6 +155,9 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// closing, so the connection cannot be reused even if it claimed
         /// keep-alive (the §14.1 pooling precondition).
         close_delimited: bool = false,
+        /// A failed bounded read must not drain an untrusted remainder or
+        /// return this connection to the pool, even if framing is already done.
+        response_aborted: bool = false,
         // ── Pool bookkeeping (owned/managed by the connection pool) ──────────
         /// Monotonic-ns timestamp this transport was established; drives the
         /// connection-lifetime knob. 0 until the pool stamps it.
@@ -94,8 +166,11 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// so the pool can re-bucket it on checkin. Empty until the pool sets it.
         origin_key: []const u8 = &.{},
         pool_permit: ?*OriginPermit = null,
+        /// The pool owns an admission reservation until matching checkin.
+        pool_admitted: bool = false,
 
         const Self = @This();
+        pub const timeout_capabilities = Transport(Raw).timeout_capabilities;
 
         /// Allocates and wires the connection in place (stable address). Takes
         /// ownership of `raw` on entry: every error path here closes it, so the
@@ -132,22 +207,74 @@ pub fn ClientConnection(comptime Raw: type) type {
         pub fn destroy(self: *Self) void {
             self.transport.deinit(self.gpa);
             self.arena.deinit();
-            if (self.flate_decoder) |d| self.gpa.destroy(d);
-            if (self.zstd_decoder) |d| self.gpa.destroy(d);
-            if (self.zstd_window) |w| self.gpa.free(w);
+            self.releaseDecoders();
             if (self.origin_key.len != 0) self.gpa.free(self.origin_key);
             self.gpa.free(self.body_buf);
             self.gpa.destroy(self);
         }
 
         /// Whether this connection may be returned to the pool after its body
-        /// has been drained. Three conditions, all required (the missing one is
-        /// the classic pool-poisoning bug): the response declared keep-alive,
+        /// has been drained: HTTP was not switched to another protocol,
+        /// the request permits reuse, the response was not
+        /// abandoned and declared keep-alive,
         /// the body was not close-delimited, and no framing error occurred
         /// while reading/draining it (a poisoned body leaves stray bytes that
         /// would corrupt the next request on the wire).
         pub fn reusableAfterDrain(self: *const Self) bool {
-            return self.head.keep_alive and !self.close_delimited and self.body.err == null;
+            return !responseSwitchesProtocol(self.request_method, self.head.status) and
+                self.request_keep_alive and !self.response_aborted and self.head.keep_alive and !self.close_delimited and self.body.err == null;
+        }
+
+        pub fn abortResponse(self: *Self) void {
+            self.response_aborted = true;
+        }
+
+        /// Called only after response use has ended, before pool storage.
+        pub fn retainIdleDecoders(self: *Self) void {
+            if (self.decoder_budget) |budget| {
+                std.debug.assert(!self.decoders_idle);
+                if (budget.retainIdle(self.decoder_bytes)) {
+                    self.decoders_idle = true;
+                } else self.releaseDecoders();
+            }
+        }
+
+        pub fn activateDecoders(self: *Self) void {
+            if (self.decoders_idle) {
+                self.decoder_budget.?.activate(self.decoder_bytes);
+                self.decoders_idle = false;
+            }
+        }
+
+        /// Response slices are no longer borrowed when the pool calls this.
+        /// A failed shrink must not retain capacity above the requested limit.
+        pub fn resetResponseArena(self: *Self, retained: ?usize) void {
+            if (!self.arena.reset(if (retained) |max| .{ .retain_with_limit = max } else .retain_capacity))
+                _ = self.arena.reset(.free_all);
+            self.head = undefined;
+        }
+
+        fn releaseDecoders(self: *Self) void {
+            if (self.flate_decoder) |d| self.gpa.destroy(d);
+            if (self.flate_window) |w| self.gpa.free(w);
+            if (self.zstd_decoder) |d| self.gpa.destroy(d);
+            if (self.zstd_window) |w| self.gpa.free(w);
+            if (self.decoder_budget) |budget| budget.release(self.decoder_bytes, self.decoders_idle);
+            self.flate_decoder = null;
+            self.flate_window = null;
+            self.zstd_decoder = null;
+            self.zstd_window = null;
+            self.decoded_reader = null;
+            self.decoder_bytes = 0;
+            self.decoders_idle = false;
+        }
+
+        /// Completes response ownership: drain healthy bodies for reuse, but
+        /// discard failed bounded reads without further network I/O.
+        pub fn finishResponse(self: *Self) bool {
+            if (self.response_aborted) return false;
+            self.body.discard() catch return false;
+            return self.reusableAfterDrain();
         }
 
         pub fn reader(self: *Self) *std.Io.Reader {
@@ -161,14 +288,17 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// Per-read deadline (kernel-level zio Timeout), the dual of the
         /// server's Connection.setReadTimeout. It stays in effect until changed,
         /// so a deadline set before reading the response head also bounds the
-        /// streamed body reads that follow. No-op on transports without timeout
-        /// support. TCP and memory pipes both support timeouts.
-        pub fn setReadTimeout(self: *Self, timeout: zio.Timeout) void {
+        /// streamed body reads that follow. Finite unsupported deadlines return
+        /// UnsupportedReadTimeout; .none explicitly disables. TCP and memory
+        /// pipes support deadlines.
+        pub fn setReadTimeout(self: *Self, timeout: zio.Timeout) timeout_mod.Error!void {
+            try timeout_capabilities.checkRead(timeout);
             self.transport.setReadTimeout(timeout);
         }
 
         /// Per-write deadline; bounds sending the request head and body.
-        pub fn setWriteTimeout(self: *Self, timeout: zio.Timeout) void {
+        pub fn setWriteTimeout(self: *Self, timeout: zio.Timeout) timeout_mod.Error!void {
+            try timeout_capabilities.checkWrite(timeout);
             self.transport.setWriteTimeout(timeout);
         }
 
@@ -196,8 +326,8 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// bounded read that distinguishes a still-open keep-alive socket from
         /// one the peer closed (or left unexpected bytes on) while idle — the
         /// classic stale-connection defense. The mechanics live in the
-        /// `Transport` seam (they differ for TLS vs plain). Transports without
-        /// timeout support (memory pipes) are assumed live.
+        /// `Transport` seam (they differ for TLS vs plain). The pool rejects
+        /// configured validation on transports without read deadline support.
         ///
         /// Must only be called on a fully-drained idle connection (no in-flight
         /// round-trip): any buffered or readable byte then means the connection
@@ -214,6 +344,8 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// does — see `roundtrip`).
         pub fn sendRequest(self: *Self, opts: codec.request_encode.HeadOptions, body: Body) !void {
             self.request_method = opts.method;
+            // Upgrade overrides the close option in the request encoder.
+            self.request_keep_alive = opts.keep_alive or opts.upgrade != null;
             const w = self.writer();
             try codec.request_encode.writeHead(w, opts);
             switch (body) {
@@ -255,21 +387,33 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// then sets up the streaming response BodyReader. The body is consumed
         /// afterward via `bodyReader()`. `max_body` caps the *raw* response body
         /// (DoS guard; null = unbounded); returns `error.ResponseBodyTooLarge`
-        /// when the declared Content-Length already exceeds it. When `decompress`
+        /// when a response with a body declares Content-Length above it.
+        /// Bodyless responses retain length metadata without spending this cap.
+        /// When `decompress`
         /// and the response carries a supported `Content-Encoding`, the body is
         /// transparently decoded — see `bodyReader`.
+        /// Informational and final heads share the default 64 KiB wire cap.
         pub fn readResponse(self: *Self, max_body: ?u64, decompress: bool) !void {
+            var budget: ResponseHeadBudget = .{};
+            return self.readResponseWithBudget(max_body, decompress, &budget);
+        }
+
+        /// Reuses caller-owned cumulative head allowance; does not reset it.
+        pub fn readResponseWithBudget(self: *Self, max_body: ?u64, decompress: bool, budget: *ResponseHeadBudget) !void {
+            self.response_aborted = false;
             const r = self.reader();
             _ = self.arena.reset(.retain_capacity);
-            self.head = try readFinalHead(r, self.arena.allocator(), &self.headers_storage);
+            self.head = try readFinalHead(r, self.arena.allocator(), &self.headers_storage, budget);
 
-            if (max_body) |max| {
-                if (self.head.content_length) |cl| {
-                    if (cl > max) return error.ResponseBodyTooLarge;
+            const has_body = responseHasBody(self.request_method, self.head.status);
+            if (has_body) {
+                if (max_body) |max| {
+                    if (self.head.content_length) |cl| {
+                        if (cl > max) return error.ResponseBodyTooLarge;
+                    }
                 }
             }
 
-            const has_body = responseHasBody(self.request_method, self.head.status);
             // Close-delimited: a body present but framed by neither
             // Content-Length nor chunked — the transport close is the only
             // terminator, so this connection is single-use (see reusableAfterDrain).
@@ -299,14 +443,33 @@ pub fn ClientConnection(comptime Raw: type) type {
         /// and reused across round-trips.
         fn initDecoder(self: *Self, content_encoding: []const u8) !?*std.Io.Reader {
             if (flateContainerFor(content_encoding)) |container| {
-                if (self.flate_decoder == null) self.flate_decoder = try self.gpa.create(flate.Decompress);
-                self.flate_decoder.?.* = flate.Decompress.init(self.body.reader(), container, &.{});
+                if (self.flate_decoder == null) {
+                    const cost = flate.max_window_len + @sizeOf(flate.Decompress);
+                    if (self.decoder_budget) |budget| try budget.reserve(cost);
+                    errdefer if (self.decoder_budget) |budget| budget.release(cost, false);
+                    const window = try self.gpa.alloc(u8, flate.max_window_len);
+                    errdefer self.gpa.free(window);
+                    const decoder = try self.gpa.create(flate.Decompress);
+                    self.flate_window = window;
+                    self.flate_decoder = decoder;
+                    self.decoder_bytes += cost;
+                }
+                self.flate_decoder.?.* = flate.Decompress.init(self.body.reader(), container, self.flate_window.?);
                 return &self.flate_decoder.?.reader;
             }
             if (std.ascii.eqlIgnoreCase(content_encoding, "zstd")) {
-                if (self.zstd_window == null)
-                    self.zstd_window = try self.gpa.alloc(u8, zstd.default_window_len + zstd.block_size_max);
-                if (self.zstd_decoder == null) self.zstd_decoder = try self.gpa.create(zstd.Decompress);
+                if (self.zstd_decoder == null) {
+                    const window_len = zstd.default_window_len + zstd.block_size_max;
+                    const cost = window_len + @sizeOf(zstd.Decompress);
+                    if (self.decoder_budget) |budget| try budget.reserve(cost);
+                    errdefer if (self.decoder_budget) |budget| budget.release(cost, false);
+                    const window = try self.gpa.alloc(u8, window_len);
+                    errdefer self.gpa.free(window);
+                    const decoder = try self.gpa.create(zstd.Decompress);
+                    self.zstd_window = window;
+                    self.zstd_decoder = decoder;
+                    self.decoder_bytes += cost;
+                }
                 // Non-empty buffer → the decoder owns its window (it does not
                 // push the capacity requirement onto the caller's writer).
                 self.zstd_decoder.?.* = zstd.Decompress.init(self.body.reader(), self.zstd_window.?, .{});
@@ -362,6 +525,10 @@ fn storedErrorIs(state: anytype, expected: anyerror) bool {
 /// `ClientConnection`.
 fn ValueTransport(comptime Raw: type) type {
     return struct {
+        pub const timeout_capabilities: timeout_mod.Capabilities = .{
+            .read = std.meta.hasMethod(Raw.Reader, "setTimeout"),
+            .write = std.meta.hasMethod(Raw.Writer, "setTimeout"),
+        };
         raw: Raw,
         reader_state: Raw.Reader,
         writer_state: Raw.Writer,
@@ -455,6 +622,10 @@ fn ValueTransport(comptime Raw: type) type {
 /// movable (only its heap-pinned internals must stay put).
 fn PinnedTransport(comptime Raw: type) type {
     return struct {
+        pub const timeout_capabilities: timeout_mod.Capabilities = .{
+            .read = std.meta.hasMethod(Raw, "setReadTimeout"),
+            .write = std.meta.hasMethod(Raw, "setWriteTimeout"),
+        };
         raw: Raw,
 
         const Self = @This();
@@ -482,11 +653,11 @@ fn PinnedTransport(comptime Raw: type) type {
         }
 
         fn setReadTimeout(self: *Self, timeout: zio.Timeout) void {
-            self.raw.setReadTimeout(timeout);
+            if (comptime timeout_capabilities.read) self.raw.setReadTimeout(timeout);
         }
 
         fn setWriteTimeout(self: *Self, timeout: zio.Timeout) void {
-            self.raw.setWriteTimeout(timeout);
+            if (comptime timeout_capabilities.write) self.raw.setWriteTimeout(timeout);
         }
 
         fn lastReadTimedOut(self: *const Self) bool {
@@ -543,20 +714,36 @@ fn readFinalHead(
     r: *std.Io.Reader,
     arena: std.mem.Allocator,
     headers_storage: []codec.Header,
+    budget: *ResponseHeadBudget,
 ) !codec.response_parser.ResponseHead {
     while (true) {
-        const head_len = try codec.findHeadEnd(r, max_head_size, null);
+        try zio.checkCancel();
+        if (budget.remaining == 0) return error.ResponseHeadersTooLarge;
+        const scan_limit = if (budget.remaining) |left| @min(left, max_head_size) else max_head_size;
+        const head_len = codec.findHeadEnd(r, scan_limit, null) catch |err| {
+            if (err == error.HeadersTooLarge and budget.remaining != null and budget.remaining.? <= max_head_size)
+                return error.ResponseHeadersTooLarge;
+            return err;
+        };
+        if (budget.remaining) |*left| left.* -= head_len;
+        // Informational heads have no public lifetime. Parse before tossing
+        // the reader buffer and allocate only for the final response. A peer
+        // sending many 1xx heads must not grow the response arena each time.
+        const borrowed = try codec.response_parser.parse(r.buffered()[0..head_len], headers_storage);
+        if (borrowed.status >= 100 and borrowed.status < 200 and borrowed.status != 101) {
+            r.toss(head_len);
+            continue;
+        }
         // Pin the head: BodyReader reads through the same reader whose buffer
         // rebases on refill (same reason as the server, protocol.zig).
         const head_bytes = try arena.dupe(u8, r.buffered()[0..head_len]);
         r.toss(head_len);
-        const head = try codec.response_parser.parse(head_bytes, headers_storage);
-        if (head.status >= 100 and head.status < 200 and head.status != 101) continue;
-        return head;
+        return codec.response_parser.parse(head_bytes, headers_storage);
     }
 }
 
 test "readFinalHead: skips interim 1xx and returns the final head" {
+    var budget: ResponseHeadBudget = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var storage: [codec.response_parser.max_headers]codec.Header = undefined;
@@ -565,19 +752,85 @@ test "readFinalHead: skips interim 1xx and returns the final head" {
             "HTTP/1.1 103 Early Hints\r\nlink: </s.css>\r\n\r\n" ++
             "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi",
     );
-    const head = try readFinalHead(&r, arena.allocator(), &storage);
+    const head = try readFinalHead(&r, arena.allocator(), &storage, &budget);
     try std.testing.expectEqual(@as(u16, 200), head.status);
     try std.testing.expectEqual(@as(?u64, 2), head.content_length);
     // Reader is left at the body — the interim heads were consumed.
     try std.testing.expectEqualStrings("hi", r.buffered());
 }
 
+test "readFinalHead: repeated informational heads do not allocate persistent storage" {
+    var head_budget: ResponseHeadBudget = .{ .remaining = null };
+    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ "x" ** 1000 ++ "\r\n\r\n";
+    var r: std.Io.Reader = .fixed(interim ** 100 ++ "HTTP/1.1 200 Final\r\ncontent-length: 2\r\nx-final: kept\r\n\r\nhi");
+    var budget: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&budget);
+    var arena = std.heap.ArenaAllocator.init(fixed.allocator());
+    defer arena.deinit();
+    var storage: [codec.response_parser.max_headers]codec.Header = undefined;
+    const head = try readFinalHead(&r, arena.allocator(), &storage, &head_budget);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqualStrings("Final", head.reason);
+    try std.testing.expectEqualStrings("kept", head.header("x-final").?);
+    try std.testing.expectEqualStrings("hi", try r.take(2));
+    try std.testing.expect(arena.queryCapacity() <= budget.len);
+}
+
+test "readFinalHead: malformed informational head is rejected without allocation" {
+    var budget: ResponseHeadBudget = .{};
+    var r: std.Io.Reader = .fixed("HTTP/1.1 103 Early Hints\r\nbad name: value\r\n\r\nHTTP/1.1 200 OK\r\n\r\n");
+    var alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var storage: [codec.response_parser.max_headers]codec.Header = undefined;
+    try std.testing.expectError(error.MalformedHeader, readFinalHead(&r, alloc.allocator(), &storage, &budget));
+    try std.testing.expectEqual(@as(usize, 0), alloc.allocations);
+}
+
+test "readFinalHead: cumulative bytes include informational and final heads but exclude body" {
+    const interim = "HTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\n";
+    const final = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+    const heads = interim ++ final;
+    for ([_]?usize{ 0, interim.len, heads.len - 1, heads.len, null }) |limit| {
+        var budget: ResponseHeadBudget = .{ .remaining = limit };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var storage: [codec.response_parser.max_headers]codec.Header = undefined;
+        var r: std.Io.Reader = .fixed(heads ++ "body");
+        if (limit != null and limit.? < heads.len) {
+            try std.testing.expectError(error.ResponseHeadersTooLarge, readFinalHead(&r, arena.allocator(), &storage, &budget));
+            try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+            if (limit == 0) try std.testing.expectEqualStrings(heads ++ "body", r.buffered());
+        } else {
+            const head = try readFinalHead(&r, arena.allocator(), &storage, &budget);
+            try std.testing.expectEqual(@as(u16, 200), head.status);
+            try std.testing.expectEqualStrings("body", r.buffered());
+            try std.testing.expectEqual(if (limit == null) @as(?usize, null) else @as(?usize, 0), budget.remaining);
+        }
+    }
+}
+
+test "readFinalHead: budget limits unterminated input and default informational floods" {
+    var storage: [codec.response_parser.max_headers]codec.Header = undefined;
+    var alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var partial: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ "x" ** 1000);
+    var small: ResponseHeadBudget = .{ .remaining = 64 };
+    try std.testing.expectError(error.ResponseHeadersTooLarge, readFinalHead(&partial, alloc.allocator(), &storage, &small));
+    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ "x" ** 1000 ++ "\r\n\r\n";
+    var flood: std.Io.Reader = .fixed(interim ** 100);
+    var budget: ResponseHeadBudget = .{};
+    try std.testing.expectError(error.ResponseHeadersTooLarge, readFinalHead(&flood, alloc.allocator(), &storage, &budget));
+    try std.testing.expectEqual(@as(usize, 0), alloc.allocations);
+    var oversized: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ "x" ** max_head_size ++ "\r\n\r\n");
+    var unlimited: ResponseHeadBudget = .{ .remaining = null };
+    try std.testing.expectError(error.HeadersTooLarge, readFinalHead(&oversized, alloc.allocator(), &storage, &unlimited));
+}
+
 test "readFinalHead: returns 101 as final (no phantom read)" {
+    var budget: ResponseHeadBudget = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var storage: [codec.response_parser.max_headers]codec.Header = undefined;
     var r: std.Io.Reader = .fixed("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n");
-    const head = try readFinalHead(&r, arena.allocator(), &storage);
+    const head = try readFinalHead(&r, arena.allocator(), &storage, &budget);
     try std.testing.expectEqual(@as(u16, 101), head.status);
 }
 
@@ -586,10 +839,26 @@ test "readFinalHead: returns 101 as final (no phantom read)" {
 /// other response is framed by Content-Length, chunked, or close-delimited.
 fn responseHasBody(method: codec.Method, status: u16) bool {
     if (method == .HEAD) return false;
-    if (method == .CONNECT and status >= 200 and status < 300) return false;
+    if (responseSwitchesProtocol(method, status)) return false;
     if (status < 200) return false; // 1xx informational
     if (status == 204 or status == 304) return false;
     return true;
+}
+
+/// The bytes after this response head belong to a new protocol, not HTTP.
+fn responseSwitchesProtocol(method: codec.Method, status: u16) bool {
+    return status == 101 or (method == .CONNECT and status >= 200 and status < 300);
+}
+
+test "responseSwitchesProtocol: only 101 and successful CONNECT end HTTP reuse" {
+    try std.testing.expect(responseSwitchesProtocol(.GET, 101));
+    for (200..300) |status| {
+        try std.testing.expect(responseSwitchesProtocol(.CONNECT, @intCast(status)));
+        try std.testing.expect(!responseSwitchesProtocol(.GET, @intCast(status)));
+    }
+    for ([_]u16{ 100, 199, 300, 407, 500 }) |status| {
+        try std.testing.expect(!responseSwitchesProtocol(.CONNECT, status));
+    }
 }
 
 test "responseHasBody: method and status rules" {
@@ -639,8 +908,8 @@ test "value transport reports read and write timeout and cancellation causes" {
             const peer = try listener.accept();
             defer peer.close();
             const timeout: zio.Timeout = if (canceling) .none else .fromMilliseconds(1);
-            conn.setReadTimeout(timeout);
-            conn.setWriteTimeout(timeout);
+            try conn.setReadTimeout(timeout);
+            try conn.setWriteTimeout(timeout);
             const F = struct {
                 fn run(c: *C, write: bool, cancel: bool, started: *zio.ResetEvent) !void {
                     started.set();

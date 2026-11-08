@@ -5,7 +5,7 @@
 //! with `std.mem` SIMD-backed scanning and a comptime fast path for common
 //! headers. Independently fuzzable.
 //!
-//! Strict RFC 9112 with request-smuggling defense:
+//! Strict HTTP/1.x head/framing subset with request-smuggling defense:
 //!   - single-SP request line, no HTAB/multi-SP separators
 //!   - token-only header names, no whitespace before the colon
 //!   - obs-fold (continuation lines) rejected

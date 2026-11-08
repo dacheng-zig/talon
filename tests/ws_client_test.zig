@@ -48,7 +48,9 @@ test "ws client: handshake, echo text + binary, close" {
 
         fn runClient(l: *MemoryListener, s: *Srv) !void {
             const Client = client.Client(client.MemoryConnector);
-            var c = Client.init(std.testing.allocator, .{ .listener = l }, .{});
+            var c = Client.init(std.testing.allocator, .{ .listener = l }, .{
+                .pool = .{ .max_active = 1, .max_waiters = 0 },
+            });
             defer c.deinit();
 
             var sock = try c.webSocket(.{
@@ -56,6 +58,8 @@ test "ws client: handshake, echo text + binary, close" {
                 .target = "/ws",
             });
             defer sock.deinit();
+            try std.testing.expectEqual(@as(usize, 1), c.poolStats().active);
+            try std.testing.expectError(error.PoolQueueFull, c.get(.{ .host = "other", .port = 80 }, "/"));
 
             // Text round-trip.
             try sock.writeText("hello");
@@ -71,6 +75,8 @@ test "ws client: handshake, echo text + binary, close" {
             // its loop, so the next read observes end-of-stream (null).
             try sock.close(.normal, "bye");
             try std.testing.expectEqual(@as(?@TypeOf(sock).Message, null), try sock.read());
+            // Wire close does not release ownership; deinit returns admission.
+            try std.testing.expectEqual(@as(usize, 1), c.poolStats().active);
 
             s.shutdown();
         }

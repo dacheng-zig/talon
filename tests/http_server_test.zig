@@ -175,6 +175,62 @@ test "talon.http.Server: POST bodies — content-length and chunked — echo bac
     try std.testing.expect(!group.hasFailed());
 }
 
+test "talon.http.Server: oversized chunk declaration receives 413 without payload or peer close" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var listener = try MemoryListener.init(std.testing.allocator, .{});
+    defer listener.deinit();
+    const App = struct {
+        rejected: usize = 0,
+
+        pub fn handle(self: *@This(), req: *Request, res: *Response) !void {
+            var bytes: [1]u8 = undefined;
+            try std.testing.expectError(error.ReadFailed, req.bodyReader().readSliceAll(&bytes));
+            try std.testing.expectEqual(error.BodyTooLarge, req.bodyError().?);
+            self.rejected += 1;
+            try res.respond("too large", .{ .status = .payload_too_large, .keep_alive = false });
+        }
+    };
+    const Srv = Server(App);
+    var app: App = .{};
+    var server = try Srv.init(std.testing.allocator, &app, .{ .limits = .{
+        .max_body_size = 8,
+        .min_body_data_rate = null,
+    } });
+    defer server.deinit();
+    const F = struct {
+        fn serve(s: *Srv, l: *MemoryListener) !void {
+            try s.serve(l);
+        }
+        fn client(s: *Srv, l: *MemoryListener) !void {
+            defer s.shutdown();
+            const conn = try l.connect();
+            defer conn.close();
+            var writer = conn.writer(&.{});
+            writer.setTimeout(.fromSeconds(2));
+            try writer.interface.writeAll("POST / HTTP/1.1\r\nhost: test\r\ntransfer-encoding: chunked\r\n\r\n9\r\n");
+            try writer.interface.flush();
+            // Keep the sending direction open and send no chunk payload.
+            var buffer: [1024]u8 = undefined;
+            var reader = conn.reader(&buffer);
+            reader.setTimeout(.fromSeconds(2));
+            const wire = try reader.interface.allocRemaining(std.testing.allocator, .limited(4096));
+            defer std.testing.allocator.free(wire);
+            try std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 413 Payload Too Large\r\n"));
+            try std.testing.expect(std.mem.endsWith(u8, wire, "\r\n\r\ntoo large"));
+        }
+    };
+    var group: zio.Group = .init;
+    defer group.cancel();
+    try group.spawn(F.serve, .{ &server, &listener });
+    try group.spawn(F.client, .{ &server, &listener });
+    try group.wait();
+    try std.testing.expect(!group.hasFailed());
+    try std.testing.expectEqual(@as(usize, 1), app.rejected);
+    try std.testing.expectEqual(@as(u64, 1), server.stats().finished_tasks);
+    try std.testing.expectEqual(@as(u64, 0), server.stats().connection_errors);
+}
+
 test "talon.http.Server: smuggling attempt is rejected with 400 and close" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();

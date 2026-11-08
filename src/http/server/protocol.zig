@@ -18,8 +18,12 @@ const parser = @import("../codec/request_parser.zig");
 const body_mod = @import("../codec/body.zig");
 const encode = @import("../codec/response_encode.zig");
 const head_scan = @import("../codec/head.zig");
+const timeout_mod = @import("../../core/timeout.zig");
 const request_mod = @import("request.zig");
 const response_mod = @import("response.zig");
+const limits_mod = @import("limits.zig");
+const EngineLimits = @import("../../core/limits.zig").Limits;
+const AllocationBudget = @import("../../core/allocation_budget.zig");
 
 pub const Request = request_mod.Request;
 pub const Upgrade = request_mod.Upgrade;
@@ -37,10 +41,37 @@ pub fn Http1Protocol(comptime App: type) type {
     }
 
     return struct {
+        pub const Limits = limits_mod.Limits;
+
+        pub fn engineLimits(limits: Limits) !EngineLimits {
+            return limits.engineLimits();
+        }
+
+        pub fn validateTransport(capabilities: timeout_mod.Capabilities, limits: Limits) timeout_mod.Error!void {
+            try capabilities.require(limits.header_read_timeout != .none or limits.keep_alive_timeout != .none or
+                limits.min_body_data_rate != null, limits.write_timeout != .none);
+        }
+
         pub fn serve(conn: anytype, app: *App) anyerror!void {
+            return serveWithConfig(conn, app, .{});
+        }
+
+        pub fn serveWithConfig(conn: anytype, app: *App, limits: Limits) anyerror!void {
+            _ = try limits.engineLimits();
+            try validateTransport(@TypeOf(conn.*).timeout_capabilities, limits);
             var date_cache: encode.DateCache = .{};
             const r = conn.reader();
             const w = conn.writer();
+            if (r.buffer.len <= limits.max_header_size) return error.HeaderBufferTooSmall;
+            // Retained capacity stays charged across request resets. The
+            // budget must outlive the arena and any upgraded protocol users.
+            var request_budget = AllocationBudget.init(conn.gpa, limits.max_request_arena_bytes orelse 0);
+            defer request_budget.deinit();
+            var request_arena = std.heap.ArenaAllocator.init(if (limits.max_request_arena_bytes != null)
+                request_budget.allocator()
+            else
+                conn.gpa);
+            defer request_arena.deinit();
             // Reused across requests on this connection: header slices stay
             // valid only for the current request (the documented contract),
             // so per-request allocation would buy nothing.
@@ -55,9 +86,9 @@ pub fn Http1Protocol(comptime App: type) type {
             // transport-specific, reached through a thunk over `conn`.
             var upgrade_taken = false;
             const UpgradeThunk = struct {
-                fn setReadTimeout(ctx: *anyopaque, timeout: zio.Timeout) void {
+                fn setReadTimeout(ctx: *anyopaque, timeout: zio.Timeout) timeout_mod.Error!void {
                     const c: @TypeOf(conn) = @ptrCast(@alignCast(ctx));
-                    c.setReadTimeout(timeout);
+                    try c.setReadTimeout(timeout);
                 }
             };
             var upgrade_ctx: Upgrade = .{
@@ -69,46 +100,50 @@ pub fn Http1Protocol(comptime App: type) type {
             };
 
             var first_request = true;
-            conn.setWriteTimeout(conn.limits.write_timeout);
+            try conn.setWriteTimeout(limits.write_timeout);
             while (true) {
                 // Release unusually large request allocations before idling.
-                resetRequestArena(conn.arena, conn.limits.max_retained_arena);
+                resetRequestArena(&request_arena, limits.max_retained_arena);
                 // Ship pending responses only when the read side is about
                 // to park (no buffered request bytes left). While pipelined
                 // requests remain buffered, responses keep accumulating in
                 // the write buffer and leave in one vectored syscall —
                 // findHeadEnd flushes before any blocking refill, so the
                 // peer is never left waiting on queued output.
-                if (r.bufferedLen() == 0) w.flush() catch return;
+                if (r.bufferedLen() == 0) try w.flush();
 
                 // Request-boundary idle wait: interruptible by shutdown,
                 // bounded by the keep-alive budget.
-                const initial_deadline = conn.limits.header_read_timeout.toDeadline();
-                conn.waitReadable(if (first_request) initial_deadline else conn.limits.keep_alive_timeout) catch return;
-                conn.setReadTimeout(if (first_request) initial_deadline else conn.limits.header_read_timeout.toDeadline());
+                const initial_request = first_request;
+                const initial_deadline = conn.initialReadTimeout(limits.header_read_timeout).toDeadline();
+                conn.waitReadable(if (first_request) initial_deadline else limits.keep_alive_timeout) catch return;
+                try conn.setReadTimeout(if (first_request) initial_deadline else limits.header_read_timeout.toDeadline());
                 first_request = false;
 
-                const head_len = head_scan.findHeadEnd(r, conn.limits.max_header_size, w) catch |err| switch (err) {
+                const head_len = head_scan.findHeadEnd(r, limits.max_header_size, w) catch |err| switch (err) {
                     error.CleanClose => return,
+                    error.WriteFailed => return err,
                     error.HeadersTooLarge => {
-                        return respondErrorAndClose(w, &date_cache, .request_header_fields_too_large, false);
+                        return respondErrorAndClose(w, &date_cache, .request_header_fields_too_large, isHeadPrefix(r.buffered()));
                     },
                     else => return, // truncated head / read failure / timeout
                 };
+                if (initial_request) conn.checkEstablishmentDeadline() catch return;
 
-                const arena = conn.arena.allocator();
+                const arena = request_arena.allocator();
+                const suppress_error_body = isHeadPrefix(r.buffered()[0..head_len]);
 
                 // Pin the head for the request's lifetime (see file doc).
                 const head_bytes = arena.dupe(u8, r.buffered()[0..head_len]) catch
-                    return respondErrorAndClose(w, &date_cache, .internal_server_error, false);
+                    return respondErrorAndClose(w, &date_cache, .internal_server_error, suppress_error_body);
                 r.toss(head_len);
 
                 const head = parser.parse(head_bytes, &headers_storage) catch |err| {
-                    return respondErrorAndClose(w, &date_cache, statusForParseError(err), false);
+                    return respondErrorAndClose(w, &date_cache, statusForParseError(err), suppress_error_body);
                 };
 
                 if (head.content_length) |cl| {
-                    if (conn.limits.max_body_size) |max| {
+                    if (limits.max_body_size) |max| {
                         if (cl > max) return respondErrorAndClose(w, &date_cache, .payload_too_large, head.method == .HEAD);
                     }
                 }
@@ -120,20 +155,20 @@ pub fn Http1Protocol(comptime App: type) type {
                         return respondErrorAndClose(w, &date_cache, .internal_server_error, head.method == .HEAD)
                 else
                     &empty_body_buffer;
-                var body = body_mod.BodyReader.init(r, &head, conn.limits.max_body_size, body_buffer);
+                var body = body_mod.BodyReader.init(r, &head, limits.max_body_size, body_buffer);
                 // The head deadline ends here. Body reads have an independent
                 // cumulative network-wait budget, not a repeatedly reset timer.
-                conn.setReadTimeout(.none);
-                var body_rate = BodyRate(@TypeOf(conn)){ .conn = conn };
-                if (has_body and conn.limits.min_body_data_rate != null) {
+                try conn.setReadTimeout(.none);
+                var body_rate = BodyRate(@TypeOf(conn)){ .conn = conn, .rate = limits.min_body_data_rate };
+                if (has_body and limits.min_body_data_rate != null) {
                     body.read_policy = .{ .ctx = &body_rate, .before = BodyRate(@TypeOf(conn)).before, .after = BodyRate(@TypeOf(conn)).after };
                 }
 
                 if (head.expect_continue) {
                     // Eager 100-continue (Kestrel defers to first body read;
                     // this keeps it simple).
-                    w.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
-                    w.flush() catch return;
+                    try w.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+                    try w.flush();
                 }
 
                 var req: Request = .{ .head = head, .arena = arena, .body = &body, .upgrade = &upgrade_ctx };
@@ -153,6 +188,10 @@ pub fn Http1Protocol(comptime App: type) type {
                 };
 
                 app.handle(&req, &res) catch |err| {
+                    // Committed upgrade output (even a failed 101 prefix)
+                    // and terminal output/cancellation errors cannot be
+                    // followed by HTTP fallback or another flush.
+                    if (upgrade_taken or err == error.WriteFailed or err == error.Canceled) return err;
                     if (!res.written) {
                         respondErrorAndClose(w, &date_cache, bodyFailureStatus(&req), head.method == .HEAD) catch {};
                     } else {
@@ -174,7 +213,7 @@ pub fn Http1Protocol(comptime App: type) type {
                 // A closing response need not drain an upload the application
                 // rejected; publish it promptly instead of waiting for the peer.
                 if (!res.keep_alive or conn.isShuttingDown()) {
-                    w.flush() catch {};
+                    try w.flush();
                     return;
                 }
 
@@ -183,12 +222,12 @@ pub fn Http1Protocol(comptime App: type) type {
                 // the connection — flush the response already produced (e.g. a
                 // 413) so it still reaches the client, then close.
                 if (has_body) body.discard() catch {
-                    w.flush() catch {};
+                    try w.flush();
                     return;
                 };
 
                 if (!head.keep_alive or !res.keep_alive or conn.isShuttingDown()) {
-                    w.flush() catch {};
+                    try w.flush();
                     return;
                 }
             }
@@ -201,6 +240,12 @@ fn bodyFailureStatus(req: *const Request) Status {
         if (err == error.BodyTooSlow) return .request_timeout;
     }
     return .internal_server_error;
+}
+
+/// Error paths can precede a parsed Head. Recognize only the complete,
+/// case-sensitive method token; this does not validate or accept the request.
+fn isHeadPrefix(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, "HEAD ");
 }
 
 fn statusForParseError(err: parser.ParseError) Status {
@@ -222,14 +267,14 @@ fn statusForParseError(err: parser.ParseError) Status {
 /// caller returning out of the connection loop.
 fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Status, suppress_body: bool) anyerror!void {
     const phrase = status.phrase() orelse "Error";
-    encode.writeHead(w, date, .{
+    try encode.writeHead(w, date, .{
         .status = status,
         .content_length = phrase.len,
         .keep_alive = false,
-    }) catch return;
+    });
     // HEAD semantics apply to protocol-generated errors as well as app output.
-    if (!suppress_body) w.writeAll(phrase) catch return;
-    w.flush() catch return;
+    if (!suppress_body) try w.writeAll(phrase);
+    try w.flush();
 }
 
 /// Cumulative network-wait accounting. Buffered payload earns credit, but
@@ -238,6 +283,7 @@ fn respondErrorAndClose(w: *std.Io.Writer, date: *encode.DateCache, status: Stat
 fn BodyRate(comptime Conn: type) type {
     return struct {
         conn: Conn,
+        rate: ?limits_mod.DataRate,
         waited_ns: u64 = 0,
         started_ns: u64 = 0,
         allowance_ns: u64 = 0,
@@ -245,20 +291,20 @@ fn BodyRate(comptime Conn: type) type {
 
         fn before(ctx: *anyopaque, produced: u64) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const rate = self.conn.limits.min_body_data_rate.?;
+            const rate = self.rate.?;
             const credit: u128 = @as(u128, produced) * std.time.ns_per_s / rate.bytes_per_sec;
             const allowance: u64 = @intCast(@min(std.math.maxInt(u64), credit + rate.grace.toNanoseconds()));
             if (self.waited_ns >= allowance) return false;
             self.allowance_ns = allowance;
             self.started_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
-            self.conn.setReadTimeout(zio.Timeout.fromNanoseconds(allowance - self.waited_ns).toDeadline());
+            self.conn.setReadTimeout(zio.Timeout.fromNanoseconds(allowance - self.waited_ns).toDeadline()) catch return false;
             return true;
         }
 
         fn after(ctx: *anyopaque) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             self.waited_ns +|= zio.Timestamp.now(.monotonic).toNanoseconds() -| self.started_ns;
-            self.conn.setReadTimeout(.none);
+            self.conn.setReadTimeout(.none) catch unreachable;
             return self.waited_ns >= self.allowance_ns;
         }
     };

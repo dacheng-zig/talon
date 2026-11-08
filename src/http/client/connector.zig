@@ -14,8 +14,9 @@
 const std = @import("std");
 const zio = @import("zio");
 const listener_mod = @import("../../core/listener.zig");
+const dial_mod = @import("../../core/dial.zig");
 
-/// Connection target. With TLS the scheme will drive ALPN; currently http only.
+/// HTTP origin policy, distinct from a protocol-neutral TCP endpoint.
 pub const Origin = struct {
     scheme: Scheme = .http,
     host: []const u8,
@@ -35,18 +36,13 @@ pub const Origin = struct {
 /// a connected stream is structurally identical to an accepted one.
 pub const TcpConnector = struct {
     pub const RawConnection = listener_mod.TcpConnection;
+    dialer: dial_mod.TcpDialer = .{},
 
     pub fn connect(self: TcpConnector, origin: Origin, timeout: zio.Timeout) !RawConnection {
-        _ = self;
         // No TLS support yet. Fail loudly instead of sending plaintext to an
         // HTTPS endpoint, which would otherwise look like a confusing parse error.
         if (origin.scheme == .https) return error.TlsNotSupported;
-        // tcpConnectToHost resolves literal IPs and host names alike; `timeout`
-        // bounds DNS + the TCP handshake (returns error.Timeout if it elapses).
-        const stream = try zio.net.tcpConnectToHost(origin.host, origin.port, .{ .timeout = timeout });
-        // Latency over throughput, matching the server's accept path.
-        stream.socket.setNoDelay(true) catch {};
-        return .{ .stream = stream };
+        return self.dialer.dial(.{ .host = origin.host, .port = origin.port }, timeout);
     }
 };
 
@@ -59,8 +55,7 @@ pub const MemoryConnector = struct {
 
     pub fn connect(self: MemoryConnector, origin: Origin, timeout: zio.Timeout) !RawConnection {
         _ = origin; // a memory listener has a single implicit endpoint
-        _ = timeout; // in-process connect is instantaneous
-        return self.listener.connect();
+        return dial_mod.MemoryDialer.dial(.{ .listener = self.listener }, {}, timeout);
     }
 };
 

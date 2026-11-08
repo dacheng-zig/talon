@@ -33,6 +33,8 @@ const server = @import("server/server.zig");
 
 /// Server-side request/response types and protocol.
 pub const Http1Protocol = server.Http1Protocol;
+pub const Limits = @import("server/limits.zig").Limits;
+pub const DataRate = @import("server/limits.zig").DataRate;
 pub const Request = server.Request;
 pub const Response = server.Response;
 

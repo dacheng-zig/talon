@@ -15,7 +15,7 @@ pub const BodyError = error{
     MalformedChunk,
     /// Chunk extensions and trailer fields are rejected by policy.
     UnsupportedChunkFeature,
-    /// Accumulated body exceeds limits.max_body_size.
+    /// Body payload or the next declared chunk exceeds max_body.
     BodyTooLarge,
     ReadFailed,
     BodyTooSlow,
@@ -265,6 +265,11 @@ pub const BodyReader = struct {
             // 16 hex digits max — overflow guard.
             if (size > (std.math.maxInt(u64) >> 4)) return self.fail(error.MalformedChunk);
             size = (size << 4) | digit;
+        }
+        // Prior chunks are fully produced before the next size line. Reject
+        // an impossible declaration without waiting for or exposing its data.
+        if (self.max_body) |max| {
+            if (self.produced > max or size > max - self.produced) return self.fail(error.BodyTooLarge);
         }
         self.chunk_remaining = size;
     }

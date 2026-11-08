@@ -91,10 +91,11 @@ pub fn readFrameHeader(r: *std.Io.Reader) (HeaderError || std.Io.Reader.Error)!F
     var len: u64 = b[1] & 0x7f;
     if (len == 126) {
         len = std.mem.readInt(u16, try r.takeArray(2), .big);
+        if (len < 126) return error.ProtocolError;
     } else if (len == 127) {
         len = std.mem.readInt(u64, try r.takeArray(8), .big);
-        // RFC 6455 §5.2: the 64-bit length's most significant bit must be 0.
-        if (len >> 63 != 0) return error.ProtocolError;
+        // RFC 6455 §5.2 requires the shortest encoding and a clear top bit.
+        if (len < 65536 or len >> 63 != 0) return error.ProtocolError;
     }
     var key: [4]u8 = @splat(0);
     if (masked) key = (try r.takeArray(4)).*;
@@ -127,7 +128,8 @@ pub fn unmask(data: []u8, key: [4]u8) void {
 
 /// Writes one frame. `mask` set means client-side framing (payload is masked
 /// into `w` in place-safe chunks); null means server-side (payload written
-/// verbatim). Does not flush.
+/// verbatim). Does not flush. Caller owns protocol validity and exclusive
+/// Writer access; use Session for validated messages and coordinated writes.
 pub fn writeFrame(
     w: *std.Io.Writer,
     opcode: Opcode,
@@ -188,7 +190,93 @@ pub const Message = union(enum) {
 pub const ReadError = error{
     ProtocolError,
     MessageTooLarge,
-} || std.Io.Reader.Error || std.Io.Writer.Error;
+    ConcurrentRead,
+} || std.Io.Reader.Error || WriteError;
+
+/// Argument errors precede writer state checks and never emit bytes or poison
+/// the session. Close reasons are measured in bytes and are never truncated.
+pub const WriteError = std.Io.Writer.Error || SendOptions.Error || error{
+    Canceled,
+    Closed,
+    InvalidUtf8,
+    ControlPayloadTooLarge,
+    InvalidCloseCode,
+    CloseReasonTooLarge,
+    /// The data call was rejected before waiting for the writer or emitting bytes.
+    SendLimitExceeded,
+};
+
+/// Optional outbound data fragmentation; controls always remain whole frames.
+pub const SendOptions = struct {
+    /// null sends each message as one frame. A positive size caps each data
+    /// frame and yields between fragments; it is not a control priority guarantee.
+    max_frame_payload: ?usize = null,
+
+    pub const Error = error{InvalidFrameSize};
+
+    pub fn validate(self: SendOptions) Error!void {
+        if (self.max_frame_payload == 0) return error.InvalidFrameSize;
+    }
+};
+
+/// Optional admission limits for unfinished text/binary sends, including whole
+/// fragmented messages. Controls and application task/allocation costs are excluded.
+pub const SendLimits = struct {
+    max_data_sends: ?usize = null,
+    max_data_bytes: ?usize = null,
+};
+
+/// Peaks include reserved calls that later cancel/fail. Only budget rejections
+/// increment rejected_data_sends; snapshots do not reset lifetime counters.
+pub const SendStats = struct {
+    in_flight_data_sends: usize = 0,
+    in_flight_data_bytes: usize = 0,
+    peak_data_sends: usize = 0,
+    peak_data_bytes: usize = 0,
+    rejected_data_sends: u64 = 0,
+};
+
+// No allocation or suspension under this short lock; independent of frame I/O.
+const DataSends = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    stats: SendStats = .{},
+
+    fn lock(self: *DataSends) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn snapshot(self: *DataSends) SendStats {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.stats;
+    }
+
+    fn reserve(self: *DataSends, limits: SendLimits, bytes: usize) error{SendLimitExceeded}!void {
+        self.lock();
+        defer self.mutex.unlock();
+        const count_limit = limits.max_data_sends orelse std.math.maxInt(usize);
+        const byte_limit = limits.max_data_bytes orelse std.math.maxInt(usize);
+        if (self.stats.in_flight_data_sends >= count_limit or
+            self.stats.in_flight_data_bytes > byte_limit or
+            bytes > byte_limit - self.stats.in_flight_data_bytes)
+        {
+            self.stats.rejected_data_sends +|= 1;
+            return error.SendLimitExceeded;
+        }
+        self.stats.in_flight_data_sends += 1;
+        self.stats.in_flight_data_bytes += bytes;
+        self.stats.peak_data_sends = @max(self.stats.peak_data_sends, self.stats.in_flight_data_sends);
+        self.stats.peak_data_bytes = @max(self.stats.peak_data_bytes, self.stats.in_flight_data_bytes);
+    }
+
+    fn release(self: *DataSends, bytes: usize) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.stats.in_flight_data_sends != 0 and self.stats.in_flight_data_bytes >= bytes);
+        self.stats.in_flight_data_sends -= 1;
+        self.stats.in_flight_data_bytes -= bytes;
+    }
+};
 
 /// A masking key from a strong entropy source (RFC 6455 §5.3): each client
 /// frame carries a fresh unpredictable key, closing the cache-poisoning vector
@@ -205,7 +293,10 @@ fn randomMaskKey() [4]u8 {
 /// reassembles fragments, answers ping with pong, echoes close, and validates
 /// UTF-8 on text — a straight-line `while (try read()) |msg|`. `role` fixes the
 /// masking direction (see `Role`); everything else is identical on both ends,
-/// so this is the single sans-io core both build on.
+/// so this is the single session implementation both build on. One reader may
+/// run alongside concurrent senders; all frame writes and flushes serialize.
+/// Keep the session at a stable address while operations are running, and join
+/// them before releasing its buffers/transport. Raw writer access bypasses this.
 pub fn Session(comptime role: Role) type {
     return struct {
         reader: *std.Io.Reader,
@@ -213,9 +304,25 @@ pub fn Session(comptime role: Role) type {
         /// Reassembly buffer sized to the largest accepted message; a bigger
         /// message closes with 1009.
         msg_buf: []u8,
+        /// Immutable during operations. Payload remains caller-owned until return.
+        send_limits: SendLimits = .{},
+        /// Immutable during operations. Default keeps the single-frame path.
+        send_options: SendOptions = .{},
+        data_sends: DataSends = .{},
         close_sent: bool = false,
+        write_failed: bool = false,
+        write_mutex: zio.Mutex = .init,
+        /// Only used with fragmentation enabled; keeps data messages contiguous.
+        message_mutex: zio.Mutex = .init,
+        read_busy: std.atomic.Value(bool) = .init(false),
+        read_ended: bool = false,
 
         const Self = @This();
+
+        /// Coherent admission snapshot, including active and waiting data calls.
+        pub fn sendStats(self: *Self) SendStats {
+            return self.data_sends.snapshot();
+        }
 
         /// Outbound mask: a fresh random key on the client, none on the server.
         fn outboundMask() ?[4]u8 {
@@ -226,6 +333,18 @@ pub fn Session(comptime role: Role) type {
         /// connection ended. Fragments are reassembled; ping is answered with
         /// pong; unsolicited pong is ignored. Control frames never surface.
         pub fn read(self: *Self) ReadError!?Message {
+            if (self.read_busy.swap(true, .acquire)) return error.ConcurrentRead;
+            defer self.read_busy.store(false, .release);
+            if (self.read_ended) return null;
+            const result = self.readMessage() catch |err| {
+                self.read_ended = true; // partial framing is not retryable
+                return err;
+            };
+            if (result == null) self.read_ended = true;
+            return result;
+        }
+
+        fn readMessage(self: *Self) ReadError!?Message {
             var assembled: usize = 0;
             var msg_opcode: ?Opcode = null;
             while (true) {
@@ -241,9 +360,8 @@ pub fn Session(comptime role: Role) type {
                     .client => !h.masked,
                 };
                 if (!inbound_ok) return self.fail(.protocol_error);
-                const len: usize = @intCast(h.payload_len);
-
                 if (h.opcode.isControl()) {
+                    const len: usize = @intCast(h.payload_len); // header caps controls at 125
                     var ctl: [max_control_payload]u8 = undefined;
                     try self.reader.readSliceAll(ctl[0..len]);
                     if (h.masked) unmask(ctl[0..len], h.mask_key);
@@ -274,7 +392,8 @@ pub fn Session(comptime role: Role) type {
                 // Subtraction keeps the bound overflow-safe: a crafted 64-bit
                 // frame length would wrap `assembled + len`. assembled never
                 // exceeds the buffer, so the right-hand side never underflows.
-                if (len > self.msg_buf.len - assembled) return self.fail(.message_too_big);
+                if (h.payload_len > self.msg_buf.len - assembled) return self.fail(.message_too_big);
+                const len: usize = @intCast(h.payload_len);
                 try self.reader.readSliceAll(self.msg_buf[assembled..][0..len]);
                 if (h.masked) unmask(self.msg_buf[assembled..][0..len], h.mask_key);
                 assembled += len;
@@ -295,43 +414,110 @@ pub fn Session(comptime role: Role) type {
             }
         }
 
-        pub fn writeText(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+        pub fn writeText(self: *Self, data: []const u8) WriteError!void {
+            if (!std.unicode.utf8ValidateSlice(data)) return error.InvalidUtf8;
             try self.writeMessage(.text, data);
         }
 
-        pub fn writeBinary(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+        pub fn writeBinary(self: *Self, data: []const u8) WriteError!void {
             try self.writeMessage(.binary, data);
         }
 
-        fn writeMessage(self: *Self, opcode: Opcode, data: []const u8) std.Io.Writer.Error!void {
-            try writeFrame(self.writer, opcode, true, data, outboundMask());
-            try self.writer.flush();
+        fn writeMessage(self: *Self, opcode: Opcode, data: []const u8) WriteError!void {
+            try self.send_options.validate();
+            try zio.checkCancel();
+            try self.data_sends.reserve(self.send_limits, data.len);
+            defer self.data_sends.release(data.len);
+            if (self.send_options.max_frame_payload) |size| {
+                return self.writeFragmented(opcode, data, size);
+            }
+            try self.lockWriter();
+            defer self.write_mutex.unlock();
+            if (self.close_sent) return error.Closed;
+            try self.sendFrame(opcode, true, data);
         }
 
-        /// Sends a ping. `data` must be at most 125 bytes (the control-frame limit).
-        pub fn writePing(self: *Self, data: []const u8) std.Io.Writer.Error!void {
+        fn writeFragmented(self: *Self, opcode: Opcode, data: []const u8, size: usize) WriteError!void {
+            try self.message_mutex.lock();
+            defer self.message_mutex.unlock();
+            var unfinished = false;
+            // A completed non-final frame is still an incomplete message.
+            // Never let another data call start after cancellation abandons it.
+            errdefer if (unfinished) self.abandonMessage();
+            var offset: usize = 0;
+            while (true) {
+                {
+                    try self.lockWriter();
+                    defer self.write_mutex.unlock();
+                    if (self.close_sent) return error.Closed;
+                    const n = @min(size, data.len - offset);
+                    const final = n == data.len - offset;
+                    try self.sendFrame(if (offset == 0) opcode else .continuation, final, data[offset..][0..n]);
+                    if (final) return;
+                    unfinished = true;
+                    offset += n;
+                }
+                // zio.Mutex allows barging. Merely releasing and immediately
+                // reacquiring the frame lock need not run a waiting control sender.
+                try zio.yield();
+            }
+        }
+
+        fn abandonMessage(self: *Self) void {
+            self.write_mutex.lockUncancelable();
+            defer self.write_mutex.unlock();
+            // A complete close legitimately aborts a fragmented message, and
+            // still permits automatic pong while awaiting the peer close.
+            if (!self.close_sent) self.write_failed = true;
+        }
+
+        /// Sends a ping; rejects payloads over 125 bytes before touching output.
+        pub fn writePing(self: *Self, data: []const u8) WriteError!void {
             try self.writeControl(.ping, data);
         }
 
-        fn writeControl(self: *Self, opcode: Opcode, data: []const u8) std.Io.Writer.Error!void {
-            std.debug.assert(data.len <= max_control_payload);
-            try writeFrame(self.writer, opcode, true, data, outboundMask());
+        fn writeControl(self: *Self, opcode: Opcode, data: []const u8) WriteError!void {
+            if (data.len > max_control_payload) return error.ControlPayloadTooLarge;
+            try self.lockWriter();
+            defer self.write_mutex.unlock();
+            if (self.close_sent and opcode != .pong) return error.Closed;
+            try self.sendFrame(opcode, true, data);
+        }
+
+        fn lockWriter(self: *Self) WriteError!void {
+            try self.write_mutex.lock();
+            errdefer self.write_mutex.unlock();
+            // Mutex's uncontended fast path does not check cancellation.
+            try zio.checkCancel();
+            if (self.write_failed) return error.WriteFailed;
+        }
+
+        /// Caller holds write_mutex for the complete frame and flush. Any I/O
+        /// failure may have emitted a prefix; never retry or append another frame.
+        fn sendFrame(self: *Self, opcode: Opcode, fin: bool, data: []const u8) std.Io.Writer.Error!void {
+            errdefer self.write_failed = true;
+            try writeFrame(self.writer, opcode, fin, data, outboundMask());
             try self.writer.flush();
         }
 
-        /// Sends a close frame (idempotent). The caller then stops reading.
-        pub fn close(self: *Self, code: CloseCode, reason: []const u8) std.Io.Writer.Error!void {
+        /// Sends one close frame. Data/ping sends then return Closed; read may
+        /// await the peer's close and still answer ping. Concurrent close is
+        /// idempotent; failed output is terminal rather than retried.
+        pub fn close(self: *Self, code: CloseCode, reason: []const u8) WriteError!void {
+            if (!validCloseCode(@intFromEnum(code))) return error.InvalidCloseCode;
+            if (reason.len > max_control_payload - 2) return error.CloseReasonTooLarge;
+            if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
+            try self.lockWriter();
+            defer self.write_mutex.unlock();
             if (self.close_sent) return;
-            var buf: [2 + 123]u8 = undefined;
+            var buf: [max_control_payload]u8 = undefined;
             std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
-            const rlen = @min(reason.len, buf.len - 2);
-            @memcpy(buf[2..][0..rlen], reason[0..rlen]);
-            try writeFrame(self.writer, .close, true, buf[0 .. 2 + rlen], outboundMask());
-            try self.writer.flush();
+            @memcpy(buf[2..][0..reason.len], reason);
+            try self.sendFrame(.close, true, buf[0 .. 2 + reason.len]);
             self.close_sent = true;
         }
 
-        fn echoClose(self: *Self) std.Io.Writer.Error!void {
+        fn echoClose(self: *Self) WriteError!void {
             try self.close(.normal, "");
         }
 
@@ -344,6 +530,22 @@ pub fn Session(comptime role: Role) type {
 }
 
 // ── Close-frame validation (direction-neutral) ──────────────────────────────
+
+test "WS data admission: cumulative integer boundaries reject without wrap and release exactly" {
+    var sends: DataSends = .{};
+    const full = std.math.maxInt(usize);
+    try sends.reserve(.{}, full);
+    try std.testing.expectError(error.SendLimitExceeded, sends.reserve(.{}, 1));
+    try std.testing.expectEqual(full, sends.snapshot().in_flight_data_bytes);
+    try sends.reserve(.{}, 0);
+    sends.release(0);
+    sends.release(full);
+    try std.testing.expectEqual(@as(usize, 0), sends.snapshot().in_flight_data_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sends.snapshot().in_flight_data_sends);
+    try sends.reserve(.{ .max_data_sends = 1, .max_data_bytes = 1 }, 1);
+    try std.testing.expectError(error.SendLimitExceeded, sends.reserve(.{ .max_data_sends = 1 }, 0));
+    sends.release(1);
+}
 
 pub const CloseValidity = enum { ok, bad_code, bad_reason };
 
@@ -468,6 +670,28 @@ test "readFrameHeader: rejects RSV bits and oversized control frames" {
     // Binary frame whose 64-bit length has the top bit set is illegal.
     var r3: std.Io.Reader = .fixed(&[_]u8{ 0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0 });
     try testing.expectError(error.ProtocolError, readFrameHeader(&r3));
+}
+
+test "readFrameHeader: rejects non-minimal extended lengths" {
+    const invalid = [_][]const u8{
+        &.{ 0x82, 126, 0, 125 },
+        &.{ 0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff },
+        // Masked input must be rejected before waiting for the mask key.
+        &.{ 0x82, 0xfe, 0, 1 },
+    };
+    for (invalid) |bytes| {
+        var reader: std.Io.Reader = .fixed(bytes);
+        try testing.expectError(error.ProtocolError, readFrameHeader(&reader));
+    }
+    const valid = [_]struct { bytes: []const u8, length: u64 }{
+        .{ .bytes = &.{ 0x82, 126, 0, 126 }, .length = 126 },
+        .{ .bytes = &.{ 0x82, 126, 0xff, 0xff }, .length = 65535 },
+        .{ .bytes = &.{ 0x82, 127, 0, 0, 0, 0, 0, 1, 0, 0 }, .length = 65536 },
+    };
+    for (valid) |case| {
+        var reader: std.Io.Reader = .fixed(case.bytes);
+        try testing.expectEqual(case.length, (try readFrameHeader(&reader)).payload_len);
+    }
 }
 
 test "closeValidity: codes and reason" {

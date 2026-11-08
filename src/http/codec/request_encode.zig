@@ -76,22 +76,24 @@ pub fn writeHead(w: *std.Io.Writer, options: HeadOptions) (std.Io.Writer.Error |
         if (rp.isReservedFramingHeader(h.name) or std.ascii.eqlIgnoreCase(h.name, "host"))
             return error.InvalidRequestField;
     }
+    for ([_]?[]const u8{ options.user_agent, options.accept, options.accept_encoding }) |value| {
+        if (value) |v| if (!rp.validFieldValue(v)) return error.InvalidRequestField;
+    }
+    if (options.upgrade) |proto| {
+        if (!rp.isToken(proto)) return error.InvalidRequestField;
+    }
 
     try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\n", .{
         method_str, options.target, options.host,
     });
-    // Policy default headers (client-supplied static values; validated like any
-    // field value so the encoder stays a strict injection boundary).
+    // Policy fields were validated before any output, like caller headers.
     if (options.user_agent) |v| {
-        if (!rp.validFieldValue(v)) return error.InvalidRequestField;
         try w.print("user-agent: {s}\r\n", .{v});
     }
     if (options.accept) |v| {
-        if (!rp.validFieldValue(v)) return error.InvalidRequestField;
         try w.print("accept: {s}\r\n", .{v});
     }
     if (options.accept_encoding) |v| {
-        if (!rp.validFieldValue(v)) return error.InvalidRequestField;
         try w.print("accept-encoding: {s}\r\n", .{v});
     }
     if (options.content_length) |cl| {
@@ -103,7 +105,6 @@ pub fn writeHead(w: *std.Io.Writer, options: HeadOptions) (std.Io.Writer.Error |
         // The upgrade drives the connection semantics, so it overrides the
         // keep-alive/close choice: an upgrade request must say `Connection:
         // upgrade`, never `close`.
-        if (!rp.isToken(proto)) return error.InvalidRequestField;
         try w.print("upgrade: {s}\r\nconnection: upgrade\r\n", .{proto});
     } else if (!options.keep_alive) {
         try w.writeAll("connection: close\r\n");
@@ -212,6 +213,22 @@ test "writeHead: emits policy default headers after host" {
             "user-agent: talon-http-client/1.0\r\naccept: */*\r\naccept-encoding: gzip, deflate\r\n\r\n",
         w.buffered(),
     );
+}
+
+test "writeHead: invalid policy fields and upgrade leave output untouched" {
+    const cases = [_]HeadOptions{
+        .{ .host = "h", .user_agent = "talon\r\nx-injected: yes" },
+        .{ .host = "h", .user_agent = "talon", .accept = "*/*\n" },
+        .{ .host = "h", .accept = "*/*", .accept_encoding = "gzip\x00" },
+        .{ .host = "h", .content_length = 1, .upgrade = "bad protocol" },
+    };
+    for (cases) |options| {
+        var buffer: [256]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try writer.writeAll("already buffered");
+        try std.testing.expectError(error.InvalidRequestField, writeHead(&writer, options));
+        try std.testing.expectEqualStrings("already buffered", writer.buffered());
+    }
 }
 
 test "writeHead: upgrade request emits upgrade+connection, no close line" {

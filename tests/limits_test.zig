@@ -2,13 +2,91 @@ const std = @import("std");
 const zio = @import("zio");
 const talon = @import("talon");
 
+test "limits: HTTP owns head capacity mapping and rejects unsafe overrides" {
+    const App = struct {
+        pub fn handle(_: *@This(), _: *talon.http.Request, _: *talon.http.Response) !void {}
+    };
+    const Srv = talon.http.Server(App);
+    var app: App = .{};
+    for ([_]usize{ 0, 127, 128 }) |capacity| {
+        try std.testing.expectError(error.HeaderBufferTooSmall, Srv.init(std.testing.allocator, &app, .{ .limits = .{
+            .max_header_size = 128,
+            .read_buffer_size = capacity,
+        } }));
+    }
+    var server = try Srv.init(std.testing.allocator, &app, .{ .limits = .{
+        .max_header_size = 128,
+        .read_buffer_size = 129,
+        .write_buffer_size = 31,
+    } });
+    defer server.deinit();
+    try std.testing.expectEqual(@as(usize, 129), server.read_pool.buffer_size);
+    try std.testing.expectEqual(@as(usize, 31), server.write_pool.buffer_size);
+    var default_server = try Srv.init(std.testing.allocator, &app, .{});
+    defer default_server.deinit();
+    try std.testing.expectEqual(@as(usize, 17 * 1024), default_server.read_pool.buffer_size);
+    var listener = try talon.MemoryListener.init(std.testing.allocator, .{});
+    defer listener.deinit();
+    server.limits.max_header_size = 129;
+    try std.testing.expectError(error.HeaderBufferTooSmall, server.serve(&listener));
+}
+
+test "limits: minimum HTTP head window serves valid input and rejects full oversized input" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const App = struct {
+        pub fn handle(_: *@This(), _: *talon.http.Request, res: *talon.http.Response) !void {
+            try res.respond("ok", .{ .keep_alive = false });
+        }
+    };
+    const Srv = talon.http.Server(App);
+    for ([_]bool{ false, true }) |oversized| {
+        var app: App = .{};
+        var listener = try talon.MemoryListener.init(std.testing.allocator, .{});
+        defer listener.deinit();
+        var server = try Srv.init(std.testing.allocator, &app, .{ .limits = .{
+            .max_header_size = 128,
+            .read_buffer_size = 129,
+            .write_buffer_size = 31,
+        } });
+        defer server.deinit();
+        const F = struct {
+            fn serve(s: *Srv, l: *talon.MemoryListener) !void {
+                try s.serve(l);
+            }
+            fn client(l: *talon.MemoryListener, s: *Srv, too_large: bool) !void {
+                defer s.shutdown();
+                const raw = try l.connect();
+                defer raw.close();
+                var writer = raw.writer(&.{});
+                writer.setTimeout(.fromSeconds(2));
+                if (too_large) {
+                    const input = [_]u8{'a'} ** 129;
+                    try writer.interface.writeAll(&input);
+                } else try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+                var buf: [256]u8 = undefined;
+                var reader = raw.reader(&buf);
+                reader.setTimeout(.fromSeconds(2));
+                const status = try reader.interface.takeDelimiterInclusive('\n');
+                try std.testing.expect(std.mem.startsWith(u8, status, if (too_large) "HTTP/1.1 431" else "HTTP/1.1 200"));
+            }
+        };
+        var group: zio.Group = .init;
+        defer group.cancel();
+        try group.spawn(F.serve, .{ &server, &listener });
+        try group.spawn(F.client, .{ &listener, &server, oversized });
+        try group.wait();
+        try std.testing.expect(!group.hasFailed());
+    }
+}
+
 test "limits: reject zero body rate or grace before serving" {
     const App = struct {
         pub fn handle(_: *@This(), _: *talon.http.Request, _: *talon.http.Response) !void {}
     };
     const Srv = talon.http.Server(App);
     var app: App = .{};
-    for ([_]talon.core.DataRate{
+    for ([_]talon.http.DataRate{
         .{ .bytes_per_sec = 0, .grace = .fromSeconds(1) },
         .{ .bytes_per_sec = 1, .grace = .fromNanoseconds(0) },
     }) |rate| {
@@ -176,24 +254,20 @@ test "limits: request arena releases exceptional allocations before reuse" {
     var listener = try talon.MemoryListener.init(std.testing.allocator, .{});
     defer listener.deinit();
     const App = struct {
-        arena: ?*std.heap.ArenaAllocator = null,
         requests: usize = 0,
         capacity_after: usize = 0,
         pub fn handle(self: *@This(), req: *talon.http.Request, res: *talon.http.Response) !void {
             self.requests += 1;
             if (self.requests == 1) {
                 _ = try req.arena.alloc(u8, 2 * 1024 * 1024);
-            } else self.capacity_after = self.arena.?.queryCapacity();
+            } else {
+                const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(req.arena.ptr));
+                self.capacity_after = arena.queryCapacity();
+            }
             try res.respond("", .{});
         }
     };
-    const Proto = struct {
-        pub fn serve(conn: anytype, app: *App) !void {
-            app.arena = conn.arena;
-            try talon.http.Http1Protocol(App).serve(conn, app);
-        }
-    };
-    const Srv = talon.StreamServer(Proto, App);
+    const Srv = talon.http.Server(App);
     var app: App = .{};
     var server = try Srv.init(std.testing.allocator, &app, .{ .limits = .{ .max_retained_arena = 8192 } });
     defer server.deinit();

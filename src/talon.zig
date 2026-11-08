@@ -4,6 +4,7 @@
 //! `talon.core` plus flattened aliases for convenience); the HTTP/1.1 protocol
 //! layer — `Server`, `Request`/`Response`, and the request/response
 //! vocabulary — lives under `talon.http`.
+//! `talon.Limits` remains an HTTP convenience alias; engine limits are core.Limits.
 
 const std = @import("std");
 
@@ -11,7 +12,8 @@ const std = @import("std");
 /// `talon.core.StreamServer` / `talon.core.framing` / … directly.
 pub const core = @import("core/core.zig");
 
-pub const Limits = core.Limits;
+/// HTTP convenience configuration. Custom engines use talon.core.Limits.
+pub const Limits = http.Limits;
 pub const StreamServer = core.StreamServer;
 pub const StreamServerWith = core.StreamServerWith;
 pub const TcpListener = core.TcpListener;

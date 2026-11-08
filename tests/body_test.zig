@@ -120,3 +120,114 @@ test "BodyReader: discard consumes unread remainder" {
     try body.discard();
     try std.testing.expectEqualStrings("NEXT", r.buffered());
 }
+
+const FragmentedBodyInput = struct {
+    interface: std.Io.Reader,
+    source: []const u8,
+    position: usize = 0,
+    chunk_size: usize,
+    payload_refills: usize = 0,
+
+    fn init(source: []const u8, buffer: []u8, chunk_size: usize) FragmentedBodyInput {
+        return .{
+            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .source = source,
+            .chunk_size = chunk_size,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *FragmentedBodyInput = @fieldParentPtr("interface", r);
+        if (self.position == self.source.len) {
+            self.payload_refills += 1;
+            return error.ReadFailed;
+        }
+        const n = limit.minInt(@min(self.chunk_size, self.source.len - self.position));
+        try w.writeAll(self.source[self.position..][0..n]);
+        self.position += n;
+        return n;
+    }
+};
+
+test "BodyReader: oversized chunk declaration rejects before payload refill in both directions" {
+    const cases = [_]struct { wire: []const u8, max: u64, prefix: []const u8 }{
+        .{ .wire = "9\r\n", .max = 8, .prefix = "" },
+        .{ .wire = "3\r\nabc\r\n6\r\n", .max = 8, .prefix = "abc" },
+        .{ .wire = "1\r\nx\r\nffffffffffffffff\r\n", .max = std.math.maxInt(u64), .prefix = "x" },
+        .{ .wire = "1\r\n", .max = 0, .prefix = "" },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |response| {
+            for (1..case.wire.len + 1) |chunk_size| {
+                var upstream_buffer: [64]u8 = undefined;
+                var input = FragmentedBodyInput.init(case.wire, &upstream_buffer, chunk_size);
+                var body_buffer: [1]u8 = undefined;
+                const head = makeHead(null, true);
+                var body = if (response)
+                    BodyReader.initResponse(&input.interface, .{ .transfer_chunked = true, .content_length = null, .has_body = true }, case.max, &body_buffer)
+                else
+                    BodyReader.init(&input.interface, &head, case.max, &body_buffer);
+                var output_buffer: [8]u8 = undefined;
+                var output: std.Io.Writer = .fixed(&output_buffer);
+                try std.testing.expectError(error.ReadFailed, body.interface.streamRemaining(&output));
+                try std.testing.expectEqual(error.BodyTooLarge, body.err.?);
+                try std.testing.expectEqual(@as(usize, 0), input.payload_refills);
+                try std.testing.expectEqualStrings(case.prefix, output.buffered());
+                try std.testing.expectEqual(@as(u64, case.prefix.len), body.produced);
+            }
+        }
+    }
+}
+
+test "BodyReader: chunk admission preserves exact payload budgets and malformed declarations" {
+    {
+        var input: std.Io.Reader = .fixed("9\r\nabcdefghi\r\n0\r\n\r\nNEXT");
+        const head = makeHead(null, true);
+        var body_buffer: [1]u8 = undefined;
+        var body = BodyReader.init(&input, &head, 8, &body_buffer);
+        var byte: [1]u8 = undefined;
+        try std.testing.expectError(error.ReadFailed, body.reader().readSliceAll(&byte));
+        try std.testing.expectEqual(error.BodyTooLarge, body.err.?);
+        try std.testing.expectEqual(@as(u64, 0), body.produced);
+        try std.testing.expectEqualStrings("abcdefghi\r\n0\r\n\r\nNEXT", input.buffered());
+    }
+    for ([_]?u64{ std.math.maxInt(u64), null }) |max| {
+        var input: std.Io.Reader = .fixed("ffffffffffffffff\r\nx");
+        const head = makeHead(null, true);
+        var body_buffer: [1]u8 = undefined;
+        var body = BodyReader.init(&input, &head, max, &body_buffer);
+        try std.testing.expectEqual(@as(u8, 'x'), try body.reader().takeByte());
+        try std.testing.expectEqual(null, body.err);
+    }
+    for ([_]?u64{ 5, null }) |max| {
+        var input: std.Io.Reader = .fixed("2\r\nab\r\n3\r\ncde\r\n0\r\n\r\nNEXT");
+        const head = makeHead(null, true);
+        var body_buffer: [1]u8 = undefined;
+        var body = BodyReader.init(&input, &head, max, &body_buffer);
+        const got = try readAllBody(&body, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings("abcde", got);
+        try std.testing.expectEqualStrings("NEXT", input.buffered());
+    }
+    {
+        var input: std.Io.Reader = .fixed("0\r\n\r\nNEXT");
+        const head = makeHead(null, true);
+        var body_buffer: [1]u8 = undefined;
+        var body = BodyReader.init(&input, &head, 0, &body_buffer);
+        try body.discard();
+        try std.testing.expectEqualStrings("NEXT", input.buffered());
+    }
+    const invalid = [_]struct { wire: []const u8, err: talon.http.codec.BodyError }{
+        .{ .wire = "9g\r\n", .err = error.MalformedChunk },
+        .{ .wire = "10000000000000000\r\n", .err = error.MalformedChunk },
+        .{ .wire = "9;ext=1\r\n", .err = error.UnsupportedChunkFeature },
+        .{ .wire = "9\r", .err = error.TruncatedBody },
+    };
+    for (invalid) |case| {
+        var input: std.Io.Reader = .fixed(case.wire);
+        const head = makeHead(null, true);
+        var body_buffer: [1]u8 = undefined;
+        var body = BodyReader.init(&input, &head, 0, &body_buffer);
+        try std.testing.expectError(case.err, body.discard());
+    }
+}

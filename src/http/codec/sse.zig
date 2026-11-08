@@ -13,8 +13,8 @@
 const std = @import("std");
 
 /// One SSE event. On the encode side every field is an input; on the decode
-/// side `data` is always set (possibly empty), `event`/`id` are the sticky
-/// last-seen values, and `comment`/`retry_ms` are not produced (comments are
+/// side `data` is always set (possibly empty), `event` belongs to that block,
+/// `id` is sticky, and `comment`/`retry_ms` are not produced (comments are
 /// ignored, retry drives reconnect state, not the event).
 pub const Event = struct {
     /// Event type name; null serializes nothing (client defaults to "message").
@@ -154,11 +154,11 @@ pub const EventDecoder = struct {
             try self.appendData(value);
         } else if (std.mem.eql(u8, name, "event")) {
             self.saw_field = true;
-            self.event_name = try self.stashBack(value);
+            try self.storeMetadata(value, self.last_id);
         } else if (std.mem.eql(u8, name, "id")) {
             self.saw_field = true;
             if (hasByte(value, 0)) return; // NUL in id: ignore the field
-            self.last_id = try self.stashBack(value);
+            try self.storeMetadata(self.event_name, value);
         } else if (std.mem.eql(u8, name, "retry")) {
             self.saw_field = true;
             // ASCII digits only (no sign); a malformed value or overflow is
@@ -194,16 +194,29 @@ pub const EventDecoder = struct {
         self.data_len += 1;
     }
 
-    // Copies a single-line value to the tail of scratch and returns a borrow.
-    // Only `event` and the sticky `id` live here; each new value bumps a fresh
-    // copy, so `event` + `id` coexist while an older overwritten copy is wasted
-    // until the next event reset.
-    fn stashBack(self: *EventDecoder, value: []const u8) DecodeError![]const u8 {
-        const back = self.backUsed();
-        if (self.data_len + back + value.len > self.scratch.len) return error.EventTooLarge;
-        const start = self.scratch.len - back - value.len;
-        @memcpy(self.scratch[start..][0..value.len], value);
-        return self.scratch[start..][0..value.len];
+    // Keep id at the tail and event immediately before it. Resetting event
+    // then releases a contiguous region without exposing the sticky id to data.
+    // One argument is the new reader-borrowed value; the other may move within
+    // scratch, so overlapping copies must preserve that existing field.
+    fn storeMetadata(self: *EventDecoder, event: ?[]const u8, id: ?[]const u8) DecodeError!void {
+        const event_len = if (event) |bytes| bytes.len else 0;
+        const id_len = if (id) |bytes| bytes.len else 0;
+        const available = self.scratch.len - self.data_len;
+        if (id_len > available or event_len > available - id_len) return error.EventTooLarge;
+        const id_start = self.scratch.len - id_len;
+        const event_start = id_start - event_len;
+        const event_dest = self.scratch[event_start..id_start];
+        const id_dest = self.scratch[id_start..];
+        if (event) |bytes| {
+            if (@intFromPtr(event_dest.ptr) > @intFromPtr(bytes.ptr)) {
+                std.mem.copyBackwards(u8, event_dest, bytes);
+            } else {
+                std.mem.copyForwards(u8, event_dest, bytes);
+            }
+        }
+        if (id) |bytes| std.mem.copyBackwards(u8, id_dest, bytes);
+        self.event_name = if (event != null) event_dest else null;
+        self.last_id = if (id != null) id_dest else null;
     }
 
     fn backUsed(self: *const EventDecoder) usize {
@@ -328,6 +341,26 @@ test "decode: two events, sticky id, default type" {
     // Second event: no id/event of its own → default type, but id stays sticky.
     try expectEvent((try dec.next()).?, null, "line one\nline two", "42");
     try testing.expectEqual(null, try dec.next());
+}
+
+test "decode: metadata stays intact when the next event fills scratch" {
+    for ([_][]const u8{
+        "event: ticker\nid: 42\ndata: a\n\ndata: 1234567890123\n\n",
+        "id: 42\nevent: ticker\ndata: a\n\ndata: 1234567890123\n\n",
+    }) |wire| {
+        var reader: std.Io.Reader = .fixed(wire);
+        var scratch: [16]u8 = undefined;
+        var decoder = EventDecoder.init(&reader, &scratch);
+        try expectEvent((try decoder.next()).?, "ticker", "a", "42");
+        try expectEvent((try decoder.next()).?, null, "1234567890123", "42");
+    }
+}
+
+test "decode: replacing metadata reclaims its old space and preserves the other field" {
+    var reader: std.Io.Reader = .fixed("event: alpha\nid: 12\nevent: b\nid: 1234\nevent: c\nid: x\ndata: ok\n\n");
+    var scratch: [8]u8 = undefined;
+    var decoder = EventDecoder.init(&reader, &scratch);
+    try expectEvent((try decoder.next()).?, "c", "ok", "x");
 }
 
 test "decode: CRLF and CR line endings" {

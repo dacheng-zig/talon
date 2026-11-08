@@ -4,7 +4,7 @@
 //! accept-loop: where the server pools idle *buffers*, the client pools idle
 //! *connections*.
 //!
-//! Design (see `docs/developer-guide.md §7`):
+//! Design (see `docs/design/http-client.md`):
 //!   - Keyed by origin = scheme://host:port; each origin owns an idle free-list.
 //!   - Two independent eviction knobs (the .NET lesson):
 //!       * `connection_lifetime` — max age since the transport was established
@@ -19,15 +19,15 @@
 //!     liveness probe evicts a connection the peer closed while idle. Off by
 //!     default — the idempotent-retry backstop already recovers from a stale
 //!     connection, and the probe adds an event-loop round-trip per reuse.
-//!   - Optional in-flight `max_per_origin` backpressure via a per-origin
-//!     `zio.Semaphore` (the undici unbounded-connections footgun fix); the idle
-//!     caps bound retained connections independently.
+//!   - Global and optional per-origin active limits share one admission queue.
+//!     Pending acquisitions are bounded separately; idle caps bound retention.
 //!
 //! Concurrency: the same `SpinLock` as the buffer pool protects map/free-list
 //! state, including allocation, freeing and container growth. Allocators used
 //! under it must not suspend; critical-section cost and contention need
-//! measurement. Dialing, liveness probes, connection destruction and semaphore
-//! waits happen outside the lock. Stat counters are atomic.
+//! measurement. Dialing, liveness probes, connection destruction and admission
+//! waits happen outside the lock. Event signaling does not suspend. Pool state
+//! and configuration must not be moved/modified during concurrent operations.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -47,6 +47,16 @@ pub const Config = struct {
     max_idle_per_origin: usize = 8,
     /// Idle connections retained across all origins.
     max_idle_total: usize = 256,
+    /// Decoder objects and windows across active and idle connections. null
+    /// disables; zero rejects transparent decoding. Fixed at pool init.
+    max_decoder_bytes: ?usize = 64 * 1024 * 1024,
+    /// Sub-budget retained by idle connections. Excess decoder storage is
+    /// freed on checkin without discarding a healthy transport. Fixed at init.
+    max_idle_decoder_bytes: usize = 1024 * 1024,
+    /// Response-head arena capacity retained per idle connection. null keeps
+    /// high-water capacity; zero frees it all. Applied at checkin, after the
+    /// response's borrowed slices have expired. Not an active allocation cap.
+    max_retained_response_arena: ?usize = 4 * 1024,
     /// Max age of a connection since it was established; null = unlimited.
     connection_lifetime: ?zio.Duration = .fromMinutes(5),
     /// Max time a connection may sit idle before eviction; null = unlimited.
@@ -57,13 +67,17 @@ pub const Config = struct {
     /// already recovers from a stale connection. Turn on for peers that
     /// aggressively close idle connections, to avoid the failed first attempt.
     validate_on_checkout: bool = false,
-    /// Max concurrent in-flight requests per origin (the undici unbounded-
-    /// connections footgun fix, §6). A checkout waits for a permit; a checkin
-    /// releases it. null = unlimited (no backpressure). Idle connections are
-    /// bounded separately by `max_idle_per_origin`.
+    /// Active acquisitions across all origins, including dial, Response body,
+    /// SSE and WebSocket ownership. null disables; zero is invalid.
+    max_active: ?usize = 256,
+    /// Tasks queued for admission across all origins. 0 rejects immediately;
+    /// null disables the queue bound. Does not bound application task creation.
+    max_waiters: ?usize = 256,
+    /// Active acquisitions per origin. null disables; zero is invalid.
+    /// Idle connections remain bounded separately.
     max_per_origin: ?usize = null,
-    /// How long a checkout waits for a per-origin permit before giving up with
-    /// `error.PoolWaitTimeout`. Only used when `max_per_origin` is set.
+    /// One admission budget, capped by the request's absolute total deadline.
+    /// Expiry returns PoolWaitTimeout; a full queue returns PoolQueueFull.
     pool_wait: zio.Timeout = .fromSeconds(10),
 };
 
@@ -75,10 +89,30 @@ pub const Stats = struct {
     reused: u64 = 0,
     /// Idle connections closed by a lifetime/idle eviction at checkout.
     evicted: u64 = 0,
+    active: usize = 0,
+    waiting: usize = 0,
+    /// Reserved decoder allocations, including allocation in progress.
+    decoder_bytes: usize = 0,
+    idle_decoder_bytes: usize = 0,
+    /// Usable response arena capacity of stored idle connections; excludes
+    /// allocator/node metadata and active Response arenas.
+    idle_response_arena_bytes: usize = 0,
 };
 
 fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
+}
+
+fn admissionDeadline(wait: zio.Timeout, total: zio.Timeout) zio.Timeout {
+    const a = wait.toDeadline();
+    const b = total.toDeadline();
+    if (a == .none) return b;
+    if (b == .none) return a;
+    return if (a.deadline.toNanoseconds() < b.deadline.toNanoseconds()) a else b;
+}
+
+fn deadlineExpired(deadline: zio.Timeout) bool {
+    return deadline == .deadline and nowNs() >= deadline.deadline.toNanoseconds();
 }
 
 /// Pure eviction predicate (deterministic; unit-tested with explicit clocks):
@@ -102,11 +136,15 @@ pub fn Pool(comptime Connector: type) type {
         gpa: std.mem.Allocator,
         connector: Connector,
         config: Config,
+        decoder_budget: conn_mod.DecoderBudget,
         mutex: SpinLock = .{},
         buckets: std.StringHashMap(Bucket),
-        /// Per-origin in-flight permits (lazily created when max_per_origin is
-        /// set). Heap-allocated so the Semaphore address stays stable.
-        sems: std.StringHashMap(*OriginPermit),
+        /// Referenced origin state, lazily created when max_per_origin is set.
+        origins: std.StringHashMap(*OriginPermit),
+        active: usize = 0,
+        waiting: usize = 0,
+        wait_head: ?*Waiter = null,
+        wait_tail: ?*Waiter = null,
         idle_total: usize = 0,
         created: std.atomic.Value(u64) = .init(0),
         reused: std.atomic.Value(u64) = .init(0),
@@ -123,14 +161,22 @@ pub fn Pool(comptime Connector: type) type {
 
         const Entry = struct { conn: *Conn, idle_ns: u64 };
         const Bucket = std.ArrayList(Entry);
+        const Waiter = struct {
+            prev: ?*Waiter = null,
+            next: ?*Waiter = null,
+            origin: ?*OriginPermit,
+            ready: zio.ResetEvent = .init,
+            granted: bool = false,
+        };
 
         pub fn init(gpa: std.mem.Allocator, connector: Connector, config: Config) Self {
             return .{
                 .gpa = gpa,
                 .connector = connector,
                 .config = config,
+                .decoder_budget = .{ .max_bytes = config.max_decoder_bytes, .max_idle_bytes = config.max_idle_decoder_bytes },
                 .buckets = std.StringHashMap(Bucket).init(gpa),
-                .sems = std.StringHashMap(*OriginPermit).init(gpa),
+                .origins = std.StringHashMap(*OriginPermit).init(gpa),
             };
         }
 
@@ -138,6 +184,7 @@ pub fn Pool(comptime Connector: type) type {
         /// Responses, WebSockets and concurrent pool operations must have
         /// finished before deinit; they borrow the pool and its origin state.
         pub fn deinit(self: *Self) void {
+            std.debug.assert(self.active == 0 and self.waiting == 0);
             var it = self.buckets.iterator();
             while (it.next()) |e| {
                 for (e.value_ptr.items) |entry| entry.conn.destroy();
@@ -146,19 +193,36 @@ pub fn Pool(comptime Connector: type) type {
             }
             self.buckets.deinit();
 
-            var sit = self.sems.iterator();
+            var sit = self.origins.iterator();
             while (sit.next()) |e| {
                 self.gpa.destroy(e.value_ptr.*);
                 self.gpa.free(e.key_ptr.*);
             }
-            self.sems.deinit();
+            self.origins.deinit();
+            const decoders = self.decoder_budget.snapshot();
+            std.debug.assert(decoders.bytes == 0 and decoders.idle_bytes == 0);
         }
 
         pub fn stats(self: *const Self) Stats {
+            // Logical constness: synchronization changes no observable state.
+            const mutex: *SpinLock = @constCast(&self.mutex);
+            mutex.lock();
+            defer mutex.unlock();
+            const decoders = @constCast(&self.decoder_budget).snapshot();
+            var arena_bytes: usize = 0;
+            var buckets = self.buckets.valueIterator();
+            while (buckets.next()) |bucket| {
+                for (bucket.items) |entry| arena_bytes += entry.conn.arena.queryCapacity();
+            }
             return .{
                 .created = self.created.load(.monotonic),
                 .reused = self.reused.load(.monotonic),
                 .evicted = self.evicted.load(.monotonic),
+                .active = self.active,
+                .waiting = self.waiting,
+                .decoder_bytes = decoders.bytes,
+                .idle_decoder_bytes = decoders.idle_bytes,
+                .idle_response_arena_bytes = arena_bytes,
             };
         }
 
@@ -166,23 +230,34 @@ pub fn Pool(comptime Connector: type) type {
         /// otherwise a freshly dialed one (bounded by `connect_timeout`). The
         /// caller owns it until `checkin`.
         pub fn checkout(self: *Self, origin: Origin, connect_timeout: zio.Timeout) !Checkout {
+            return self.checkoutWithDeadline(origin, connect_timeout, .none);
+        }
+
+        /// request_deadline is an absolute total budget; it caps admission as
+        /// well as connect in Client. Direct pool users may pass .none.
+        pub fn checkoutWithDeadline(self: *Self, origin: Origin, connect_timeout: zio.Timeout, request_deadline: zio.Timeout) !Checkout {
+            try zio.checkCancel();
+            if (self.config.max_decoder_bytes != self.decoder_budget.max_bytes or
+                self.config.max_idle_decoder_bytes != self.decoder_budget.max_idle_bytes)
+                return error.ResourceLimitsChanged;
+            try Conn.timeout_capabilities.require(self.config.validate_on_checkout, false);
+            if (self.config.max_active == 0 or self.config.max_per_origin == 0) return error.InvalidPoolLimit;
             var key_buf: [max_origin_key]u8 = undefined;
             const key: ?[]const u8 = formatKey(&key_buf, origin);
-
-            // In-flight backpressure: acquire a per-origin permit before
-            // reusing/dialing. Held until the matching checkin releases it.
             var permit: ?*OriginPermit = null;
-            if (self.config.max_per_origin) |max| {
-                if (key) |k| {
-                    const state = try self.retainOrigin(k, max);
-                    state.sem.timedWait(self.config.pool_wait) catch |err| {
-                        self.releaseOrigin(state, false);
-                        return if (err == error.Canceled) error.Canceled else error.PoolWaitTimeout;
-                    };
-                    permit = state;
-                }
+            if (self.config.max_per_origin != null) {
+                // Unpoolable long keys still obey admission. This temporary
+                // key is copied into referenced origin state, never retained.
+                const owned = if (key == null) try std.fmt.allocPrint(self.gpa, "{s}://{s}:{d}", .{
+                    @tagName(origin.scheme), origin.host, origin.port,
+                }) else null;
+                defer if (owned) |k| self.gpa.free(k);
+                permit = try self.retainOrigin(key orelse owned.?);
             }
-            errdefer if (permit) |state| self.releaseOrigin(state, true);
+            errdefer if (permit) |state| self.releaseOrigin(state);
+            const total_deadline = request_deadline.toDeadline();
+            try self.acquire(permit, admissionDeadline(self.config.pool_wait, total_deadline), total_deadline);
+            errdefer self.releaseSlot(permit);
             // An expired/stale idle connection can leave an empty warm bucket.
             // Redial failure must reclaim it even when permits are disabled.
             errdefer if (key) |k| self.dropEmptyBucketIfPresent(k);
@@ -200,7 +275,9 @@ pub fn Pool(comptime Connector: type) type {
                         continue;
                     }
                     _ = self.reused.fetchAdd(1, .monotonic);
+                    entry.conn.activateDecoders();
                     entry.conn.pool_permit = permit;
+                    entry.conn.pool_admitted = true;
                     return .{ .conn = entry.conn, .reused = true };
                 }
             }
@@ -211,6 +288,7 @@ pub fn Pool(comptime Connector: type) type {
                 if (key) |k| self.dropEmptyBucketIfPresent(k);
             }
             conn.pool_permit = permit;
+            conn.pool_admitted = true;
             return .{ .conn = conn, .reused = false };
         }
 
@@ -221,8 +299,13 @@ pub fn Pool(comptime Connector: type) type {
             // Keep the origin alive until checkin has either stored or destroyed
             // the connection. The permit owns its key independently of conn.
             const permit = conn.pool_permit;
+            const admitted = conn.pool_admitted;
             conn.pool_permit = null;
-            defer if (permit) |state| self.releaseOrigin(state, true);
+            conn.pool_admitted = false;
+            defer {
+                if (admitted) self.releaseSlot(permit);
+                if (permit) |state| self.releaseOrigin(state);
+            }
             if (!reusable or conn.origin_key.len == 0) {
                 self.dropEmptyBucketIfPresent(conn.origin_key);
                 return conn.destroy();
@@ -236,6 +319,8 @@ pub fn Pool(comptime Connector: type) type {
                 }
             }
 
+            conn.retainIdleDecoders();
+            conn.resetResponseArena(self.config.max_retained_response_arena);
             self.mutex.lock();
             if (self.idle_total >= self.config.max_idle_total) {
                 self.mutex.unlock();
@@ -306,6 +391,33 @@ pub fn Pool(comptime Connector: type) type {
             return reaped;
         }
 
+        /// Destroys a snapshot of all current idle connections, including their
+        /// decoder/arena/transport storage and bucket metadata. Active checkouts
+        /// and admission waiters retain ownership. Concurrent checkin may cache
+        /// new entries after the snapshot; this call does not chase them.
+        /// May suspend in raw.close(); safe with checkout/checkin, not deinit().
+        pub fn trimIdleConnections(self: *Self) usize {
+            self.mutex.lock();
+            var idle = self.buckets;
+            self.buckets = std.StringHashMap(Bucket).init(self.gpa);
+            const count = self.idle_total;
+            self.idle_total = 0;
+            var keys = idle.keyIterator();
+            while (keys.next()) |key| self.collectOrigin(key.*);
+            if (self.origins.count() == 0) self.origins.clearAndFree();
+            self.mutex.unlock();
+
+            var it = idle.iterator();
+            while (it.next()) |bucket| {
+                for (bucket.value_ptr.items) |entry| entry.conn.destroy();
+                bucket.value_ptr.deinit(self.gpa);
+                self.gpa.free(bucket.key_ptr.*);
+            }
+            idle.deinit();
+            if (count != 0) _ = self.evicted.fetchAdd(count, .monotonic);
+            return count;
+        }
+
         // ── internals ───────────────────────────────────────────────────────
 
         fn popExpired(self: *Self, now_ns: u64) ?*Conn {
@@ -352,12 +464,12 @@ pub fn Pool(comptime Connector: type) type {
             }
         }
 
-        /// Retain before waiting, so a returning holder cannot free a semaphore
-        /// that a waiter is about to use. Caller later releases on every path.
-        fn retainOrigin(self: *Self, key: []const u8, max: usize) !*OriginPermit {
+        /// Retain before admission, so a returning holder cannot free origin
+        /// state that a waiter is using. Release on every checkout/checkin path.
+        fn retainOrigin(self: *Self, key: []const u8) !*OriginPermit {
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.sems.get(key)) |state| {
+            if (self.origins.get(key)) |state| {
                 state.users += 1;
                 return state;
             }
@@ -365,15 +477,12 @@ pub fn Pool(comptime Connector: type) type {
             errdefer self.gpa.free(owned);
             const state = try self.gpa.create(OriginPermit);
             errdefer self.gpa.destroy(state);
-            state.* = .{ .sem = .{ .permits = max }, .key = owned };
-            try self.sems.put(owned, state);
+            state.* = .{ .key = owned };
+            try self.origins.put(owned, state);
             return state;
         }
 
-        fn releaseOrigin(self: *Self, state: *OriginPermit, held: bool) void {
-            // post can wake another task. This reference remains live until
-            // post returns; the awakened waiter already owns its own reference.
-            if (held) state.sem.post();
+        fn releaseOrigin(self: *Self, state: *OriginPermit) void {
             self.mutex.lock();
             defer self.mutex.unlock();
             std.debug.assert(state.users != 0);
@@ -381,13 +490,114 @@ pub fn Pool(comptime Connector: type) type {
             self.collectOrigin(state.key);
         }
 
+        fn available(self: *Self, origin: ?*OriginPermit) bool {
+            if (self.config.max_active) |max| if (self.active >= max) return false;
+            if (origin) |state| if (state.active >= self.config.max_per_origin.?) return false;
+            return true;
+        }
+
+        fn grant(self: *Self, origin: ?*OriginPermit) void {
+            self.active += 1;
+            if (origin) |state| state.active += 1;
+        }
+
+        fn removeWaiter(self: *Self, waiter: *Waiter) void {
+            if (waiter.prev) |p| p.next = waiter.next else self.wait_head = waiter.next;
+            if (waiter.next) |n| n.prev = waiter.prev else self.wait_tail = waiter.prev;
+            self.waiting -= 1;
+        }
+
+        /// Oldest eligible first; a saturated origin does not stall other
+        /// origins. Grants both reservations before waking, so no slot hoarding.
+        /// Event.set does not suspend; the waiter reacquires mutex before exit.
+        fn wakeWaiters(self: *Self) void {
+            var next = self.wait_head;
+            while (next) |waiter| {
+                next = waiter.next;
+                if (!self.available(waiter.origin)) continue;
+                self.grant(waiter.origin);
+                self.removeWaiter(waiter);
+                waiter.granted = true;
+                waiter.ready.set();
+            }
+        }
+
+        fn acquire(self: *Self, origin: ?*OriginPermit, deadline: zio.Timeout, total_deadline: zio.Timeout) !void {
+            var waiter: Waiter = .{ .origin = origin };
+            self.mutex.lock();
+            self.wakeWaiters();
+            if (deadlineExpired(total_deadline)) {
+                self.mutex.unlock();
+                return error.PoolWaitTimeout;
+            }
+            if (self.available(origin)) {
+                self.grant(origin);
+                self.mutex.unlock();
+                return;
+            }
+            if (deadlineExpired(deadline)) {
+                self.mutex.unlock();
+                return error.PoolWaitTimeout;
+            }
+            if (self.config.max_waiters) |max| {
+                if (self.waiting >= max) {
+                    self.mutex.unlock();
+                    return error.PoolQueueFull;
+                }
+            }
+            waiter.prev = self.wait_tail;
+            if (self.wait_tail) |tail| tail.next = &waiter else self.wait_head = &waiter;
+            self.wait_tail = &waiter;
+            self.waiting += 1;
+            self.mutex.unlock();
+
+            const wait_error: ?anyerror = if (waitForGrant(&waiter, deadline)) |_| null else |err| err;
+            self.mutex.lock();
+            // Even a grant racing cancellation/expiry must be returned before
+            // the stack waiter disappears. The origin reference remains live.
+            if (wait_error == null and !deadlineExpired(deadline)) {
+                std.debug.assert(waiter.granted);
+                self.mutex.unlock();
+                return;
+            }
+            if (waiter.granted) {
+                self.revoke(origin);
+            } else self.removeWaiter(&waiter);
+            self.wakeWaiters();
+            self.mutex.unlock();
+            if (wait_error) |err| if (err == error.Canceled) return error.Canceled;
+            return error.PoolWaitTimeout;
+        }
+
+        fn waitForGrant(waiter: *Waiter, deadline: zio.Timeout) !void {
+            try waiter.ready.timedWait(deadline);
+            // Event's already-set fast path does not check cancellation.
+            try zio.checkCancel();
+        }
+
+        fn releaseSlot(self: *Self, origin: ?*OriginPermit) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.revoke(origin);
+            self.wakeWaiters();
+        }
+
+        fn revoke(self: *Self, origin: ?*OriginPermit) void {
+            std.debug.assert(self.active != 0);
+            self.active -= 1;
+            if (origin) |state| {
+                std.debug.assert(state.active != 0);
+                state.active -= 1;
+            }
+        }
+
         /// Under the pool lock. Idle connections retain warm origin state;
         /// removing their last bucket triggers collection as well.
         fn collectOrigin(self: *Self, key: []const u8) void {
-            const state = self.sems.get(key) orelse return;
+            const state = self.origins.get(key) orelse return;
             if (state.users != 0) return;
             if (self.buckets.get(key)) |bucket| if (bucket.items.len != 0) return;
-            _ = self.sems.remove(key);
+            _ = self.origins.remove(key);
             self.gpa.free(state.key);
             self.gpa.destroy(state);
         }
@@ -411,6 +621,7 @@ pub fn Pool(comptime Connector: type) type {
             // path, so no `raw.close()` here (that double-closed the fd on a
             // mid-create OOM — see ClientConnection.create).
             const conn = try Conn.create(self.gpa, raw);
+            conn.decoder_budget = &self.decoder_budget;
             conn.created_ns = nowNs();
             // An owned key lets this connection re-bucket on checkin. If the
             // origin was unpoolable (too long) or the dupe fails, the key stays

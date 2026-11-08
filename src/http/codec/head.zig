@@ -10,8 +10,8 @@
 //! *before* the buffer fills. If the buffer were sized exactly to
 //! `max_header_size`, a peer could fill it with non-terminator bytes; the next
 //! `fillMore` on a full buffer hits std's rebase assert (panic in safe builds)
-//! or spins returning 0 (ReleaseFast). Call sites (stream_server read pool,
-//! client connection) size their buffers with slack to honor this.
+//! or spins returning 0 (ReleaseFast). HTTP server policy and client connection
+//! size their buffers with slack; the server protocol also checks at entry.
 
 const std = @import("std");
 
@@ -23,6 +23,8 @@ pub const HeadEndError = error{
     /// Peer closed mid-head.
     TruncatedHead,
     ReadFailed,
+    /// Publishing pending output failed before a read refill.
+    WriteFailed,
 };
 
 /// Returns the head length INCLUDING the final "\r\n\r\n".
@@ -45,7 +47,7 @@ pub fn findHeadEnd(
         }
         if (window.len > max_header_size) return error.HeadersTooLarge;
         search_start = window.len -| 3;
-        if (pending) |w| w.flush() catch return error.ReadFailed;
+        if (pending) |w| try w.flush();
         r.fillMore() catch |err| switch (err) {
             error.EndOfStream => return if (r.bufferedLen() == 0)
                 error.CleanClose

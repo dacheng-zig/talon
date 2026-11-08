@@ -38,7 +38,7 @@ pub const Origin = connector_mod.Origin;
 pub const TcpConnector = connector_mod.TcpConnector;
 pub const MemoryConnector = connector_mod.MemoryConnector;
 
-/// TLS outbound transport (std `crypto.tls.Client` over zio sockets). A
+/// TLS outbound transport (fixed std TLS compatibility source over zio sockets). A
 /// `TlsConnector` dials `https` (and plaintext `http`) origins; `RootStore`
 /// holds the system trust anchors; `Verification` selects the trust policy.
 pub const TlsConnector = tls_mod.TlsConnector;
@@ -48,6 +48,7 @@ pub const Method = codec.Method;
 pub const Header = codec.Header;
 pub const PoolConfig = pool_mod.Config;
 pub const PoolStats = pool_mod.Stats;
+pub const ResponseHeadBudget = conn_mod.ResponseHeadBudget;
 
 /// Request body source: `.none`, in-memory `.bytes`, or a streaming
 /// `.reader`(known length)/`.chunked`(unknown length) upload. See
@@ -62,6 +63,25 @@ const default_user_agent = "talon-http-client/1.0";
 const default_accept = "*/*";
 const default_accept_encoding = "gzip, deflate, zstd";
 
+fn requestHost(origin: Origin, buffer: []u8) ![]const u8 {
+    const default_port = origin.port == Origin.defaultPort(origin.scheme);
+    if (std.mem.indexOfScalar(u8, origin.host, ':') != null) {
+        return if (default_port)
+            std.fmt.bufPrint(buffer, "[{s}]", .{origin.host})
+        else
+            std.fmt.bufPrint(buffer, "[{s}]:{d}", .{ origin.host, origin.port });
+    }
+    return if (default_port) origin.host else std.fmt.bufPrint(buffer, "{s}:{d}", .{ origin.host, origin.port });
+}
+
+test "client: Host brackets bare IPv6 while keeping scheme default ports implicit" {
+    var buffer: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("[::1]", try requestHost(.{ .scheme = .https, .host = "::1", .port = 443 }, &buffer));
+    try std.testing.expectEqualStrings("[::1]:8443", try requestHost(.{ .scheme = .https, .host = "::1", .port = 8443 }, &buffer));
+    try std.testing.expectEqualStrings("127.0.0.1", try requestHost(.{ .scheme = .https, .host = "127.0.0.1", .port = 443 }, &buffer));
+    try std.testing.expectEqualStrings("example.com:8080", try requestHost(.{ .host = "example.com", .port = 8080 }, &buffer));
+}
+
 /// Case-insensitive presence check over a caller header list (used to suppress
 /// a policy default the caller already set).
 fn headerPresent(headers: []const Header, name: []const u8) bool {
@@ -71,10 +91,8 @@ fn headerPresent(headers: []const Header, name: []const u8) bool {
     return false;
 }
 
-/// Per-stage deadlines, all kernel-level zio timeouts. The defenses against a
-/// slow/stalled peer hanging the caller (the requests-had-no-default-timeout
-/// lesson — see docs §3). `.none` disables a stage. A whole-request `total`
-/// deadline (coroutine-level cancel) is a follow-up.
+/// Per-stage zio I/O deadlines capped by one whole-request deadline.
+/// `.none` disables the respective budget.
 pub const Timeouts = struct {
     /// DNS + TCP handshake when dialing a fresh connection.
     connect: zio.Timeout = .fromSeconds(10),
@@ -87,7 +105,8 @@ pub const Timeouts = struct {
     /// (and across retries). Caps each stage to the tighter of its own timeout
     /// and the time left, so a peer dribbling bytes just under the per-read
     /// timeout still cannot drag the call out indefinitely. `.none` disables.
-    /// Only enforced on transports with timeout support (no-op on custom transports without timeout support).
+    /// Requires read and write timeout support; unsupported finite budgets
+    /// fail before dialing or reusing a connection.
     total: zio.Timeout = .fromSeconds(60),
 };
 
@@ -164,8 +183,7 @@ pub fn bearerAuth(comptime token: []const u8) type {
 /// The attached Cookie header rides `ctx.spec.extra_headers`, so a cross-origin
 /// redirect strips it (docs §15.4) — host-keyed storage plus that stripping
 /// keep cookies from leaking across origins. Set-Cookie is attributed to the
-/// request's origin host (the redirect-hop attribution nuance is out of scope
-/// for this minimal jar).
+/// final response's origin host; intermediate-hop cookies are not stored.
 pub const cookies = struct {
     pub fn run(ctx: anytype, next: anytype) anyerror!void {
         const jar = ctx.client.cookie_jar orelse return next.call(ctx);
@@ -211,10 +229,9 @@ fn isRedirectStatus(status: u16) bool {
     return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
 }
 
-/// Whether the redirect rewrites the method to GET and drops the body: 303
-/// always, and 301/302 for POST (the de-facto browser/curl behavior). 307/308
-/// preserve method and body.
-fn redirectRewritesToGet(status: u16, method: Method) bool {
+/// 303 drops the body and uses GET or preserves HEAD; 301/302 rewrite POST.
+/// 307/308 preserve method and body (RFC 9110 §15.4).
+fn redirectDropsBody(status: u16, method: Method) bool {
     return status == 303 or ((status == 301 or status == 302) and method == .POST);
 }
 
@@ -228,20 +245,28 @@ fn isSensitiveHeader(name: []const u8) bool {
     return false;
 }
 
-/// Allocates a copy of `headers` with the sensitive ones removed (the Header
-/// structs still borrow the caller's name/value slices).
-fn stripSensitive(gpa: std.mem.Allocator, headers: []const Header) ![]Header {
+fn isBodyHeader(name: []const u8) bool {
+    const names = [_][]const u8{ "content-encoding", "content-language", "content-location", "content-type" };
+    for (names) |header| {
+        if (std.ascii.eqlIgnoreCase(name, header)) return true;
+    }
+    return false;
+}
+
+/// Filter the current hop's headers so later redirects cannot restore fields
+/// removed with a discarded body. Name/value slices remain caller-owned.
+fn redirectHeaders(gpa: std.mem.Allocator, headers: []const Header, strip_credentials: bool, drop_body: bool) ![]Header {
     var keep: usize = 0;
     for (headers) |h| {
-        if (!isSensitiveHeader(h.name)) keep += 1;
+        if ((strip_credentials and isSensitiveHeader(h.name)) or (drop_body and isBodyHeader(h.name))) continue;
+        keep += 1;
     }
     const out = try gpa.alloc(Header, keep);
     var i: usize = 0;
     for (headers) |h| {
-        if (!isSensitiveHeader(h.name)) {
-            out[i] = h;
-            i += 1;
-        }
+        if ((strip_credentials and isSensitiveHeader(h.name)) or (drop_body and isBodyHeader(h.name))) continue;
+        out[i] = h;
+        i += 1;
     }
     return out;
 }
@@ -416,6 +441,9 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// guard against a malicious/compromised server, incl. close-delimited
         /// bodies). null disables the cap. Settable after init.
         max_response_body: ?u64,
+        /// Wire head bytes across this logical request, including 1xx and
+        /// redirects. null disables the cumulative cap; single-head cap remains.
+        max_response_head_bytes: ?usize,
         /// Per-stage deadlines applied to every round-trip. Settable after init.
         timeouts: Timeouts,
         /// Transparent-retry policy for failed reused connections.
@@ -438,6 +466,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         pub const Options = struct {
             /// null disables the cap.
             max_response_body: ?u64 = default_max_response_body,
+            max_response_head_bytes: ?usize = ResponseHeadBudget.default_max_bytes,
             pool: PoolConfig = .{},
             timeouts: Timeouts = .{},
             retry: RetryConfig = .{},
@@ -484,27 +513,32 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// client's `max_response_body` only caps the *compressed* input —
             /// a `Content-Encoding` decoder can amplify a small body into a huge
             /// one (a decompression bomb), so the *decoded* output needs its own
-            /// cap. Caller frees the returned slice.
+            /// cap. Collection capacity never exceeds the cap; fixed decoder
+            /// workspace and temporary allocator growth are separate. On any
+            /// read/allocation failure, deinit closes without draining. Caller
+            /// frees the returned slice.
             pub fn readAllAlloc(self: Response, gpa: std.mem.Allocator, max_decoded: usize) ![]u8 {
-                // Stream the whole (decoded) body, then reject if it exceeds the
-                // cap. `streamRemaining` (unlimited) is used deliberately: a
-                // finite Limit must NOT be passed to the BodyReader — when its
-                // budget hits 0 mid-body its `stream` returns 0 (not EndOfStream)
-                // and any read-to-end loop spins forever (std `allocRemaining`
-                // has the same hazard against this reader). The decoded output
-                // is bounded by available memory during the read (an extreme
-                // decompression bomb surfaces as `error.OutOfMemory`); the
-                // `max_decoded` check then rejects anything that fit in memory
-                // but is still over the policy cap. The compressed *input* is
-                // already capped upstream by `max_response_body`.
-                var aw: std.Io.Writer.Allocating = .init(gpa);
-                errdefer aw.deinit();
-                _ = self.bodyReader().streamRemaining(&aw.writer) catch |err| switch (err) {
-                    error.ReadFailed => return error.ReadFailed,
-                    error.WriteFailed => return error.OutOfMemory,
-                };
-                if (aw.written().len > max_decoded) return error.ResponseTooLarge;
-                return aw.toOwnedSlice();
+                errdefer self.conn.abortResponse();
+                var out: std.ArrayList(u8) = .empty;
+                errdefer out.deinit(gpa);
+                var chunk: [4096]u8 = undefined;
+                const reader = self.bodyReader();
+                while (true) {
+                    const remaining = max_decoded - out.items.len;
+                    // Never ask a reader to stream with a zero budget: it may
+                    // return zero without EOF. At the cap, probe one byte on
+                    // the stack instead of growing the output allocation.
+                    const len = if (remaining == 0) 1 else @min(remaining, chunk.len);
+                    const n = try reader.readSliceShort(chunk[0..len]);
+                    if (n == 0) return out.toOwnedSlice(gpa);
+                    if (remaining == 0) return error.ResponseTooLarge;
+                    const needed = out.items.len + n;
+                    if (needed > out.capacity) {
+                        const growth = out.capacity +| @max(out.capacity, chunk.len);
+                        try out.ensureTotalCapacityPrecise(gpa, @min(max_decoded, @max(needed, growth)));
+                    }
+                    out.appendSliceAssumeCapacity(chunk[0..n]);
+                }
             }
 
             /// Reads and parses the (decoded) body as JSON into `T` — the
@@ -522,23 +556,18 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 gpa: std.mem.Allocator,
                 max_decoded: usize,
             ) !std.json.Parsed(T) {
-                var aw: std.Io.Writer.Allocating = .init(gpa);
-                defer aw.deinit();
-                _ = self.bodyReader().streamRemaining(&aw.writer) catch |err| switch (err) {
-                    error.ReadFailed => return error.ReadFailed,
-                    error.WriteFailed => return error.OutOfMemory,
-                };
-                if (aw.written().len > max_decoded) return error.ResponseTooLarge;
-                return std.json.parseFromSlice(T, gpa, aw.written(), .{ .allocate = .alloc_always });
+                const bytes = try self.readAllAlloc(gpa, max_decoded);
+                defer gpa.free(bytes);
+                return std.json.parseFromSlice(T, gpa, bytes, .{ .allocate = .alloc_always });
             }
 
             /// Drains any unread body (so the transport ends cleanly) and hands
             /// the connection back to the pool — returned for reuse if the
-            /// response was keep-alive and the body framed cleanly, closed
-            /// otherwise.
+            /// request and response allowed keep-alive, HTTP was not switched
+            /// to another protocol, and the body framed cleanly; closed
+            /// otherwise. Failed bounded reads close immediately without drain.
             pub fn deinit(self: Response) void {
-                self.conn.body.discard() catch {};
-                self.pool.checkin(self.conn, self.conn.reusableAfterDrain());
+                self.pool.checkin(self.conn, self.conn.finishResponse());
             }
         };
 
@@ -569,6 +598,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .gpa = gpa,
                 .pool = Pool.init(gpa, connector, options.pool),
                 .max_response_body = options.max_response_body,
+                .max_response_head_bytes = options.max_response_head_bytes,
                 .timeouts = options.timeouts,
                 .retry = options.retry,
                 .redirect = options.redirect,
@@ -582,7 +612,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             self.pool.deinit();
         }
 
-        /// Live pool counters (created / reused / evicted).
+        /// Pool counters and current active/waiting admission gauges.
         pub fn poolStats(self: *const Self) PoolStats {
             return self.pool.stats();
         }
@@ -592,6 +622,13 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// reclamation spawn `reapLoop` into a Group.
         pub fn reapIdle(self: *Self) usize {
             return self.pool.reapExpired();
+        }
+
+        /// Releases currently idle connections regardless of age. Does not
+        /// interrupt Responses/SSE/WS or prevent later checkin from caching.
+        /// May suspend in transport close; do not run concurrently with deinit.
+        pub fn trimIdleConnections(self: *Self) usize {
+            return self.pool.trimIdleConnections();
         }
 
         /// Runs `reapIdle` every `interval` until canceled — the proactive idle
@@ -667,7 +704,8 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// and connection retry (per `retry`).
         ///
         /// Redirects are followed by re-issuing to the `Location` target, with
-        /// method rewriting (303 / POST-on-301-302 → GET) and, on a cross-origin
+        /// method rewriting (303 preserves HEAD, otherwise uses GET;
+        /// POST-on-301-302 uses GET) and, on a cross-origin
         /// hop, stripping of `Authorization`/`Cookie` unless `unrestricted_auth`.
         /// On reaching `redirect.max`, or a redirect with no/invalid `Location`,
         /// the redirect response itself is returned.
@@ -677,6 +715,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // the entire call, not each hop independently (else N redirects could
             // each consume the full budget).
             const deadline = totalDeadline((spec.timeouts orelse self.timeouts).total);
+            var head_budget: conn_mod.ResponseHeadBudget = .{ .remaining = self.max_response_head_bytes };
             var cur = spec;
             var redirects: u8 = 0;
             // Owns strings derived from each hop's Location (host+target); freed
@@ -688,7 +727,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             defer if (hdr_buf) |h| self.gpa.free(h);
 
             while (true) {
-                const resp = try self.send(cur, deadline);
+                const resp = try self.send(cur, deadline, &head_budget);
                 const status = resp.status();
                 if (redirects >= self.redirect.max or !isRedirectStatus(status)) return resp;
 
@@ -699,27 +738,32 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 // replayed, so hand the redirect back rather than send an empty
                 // or corrupt body. POST→GET rewrites drop the body, so they are
                 // always safe.
-                if (!redirectRewritesToGet(status, cur.method) and !cur.body.replayable())
+                const drop_body = redirectDropsBody(status, cur.method);
+                if (!drop_body and !cur.body.replayable())
                     return resp;
 
                 const resolved = resolveLocation(self.gpa, cur.origin, cur.target, location) catch
                     return resp; // unresolvable Location: hand back the redirect as-is
+                // cur.origin.host may borrow the previous loc_buf. Classify
+                // the hop while that storage is still owned and live.
+                const cross = !sameOrigin(cur.origin, resolved.origin);
                 resp.deinit(); // drains + pools/closes the connection; `location` now dead
 
                 if (loc_buf) |b| self.gpa.free(b);
                 loc_buf = resolved.buf;
 
-                const cross = !sameOrigin(cur.origin, resolved.origin);
                 cur.origin = resolved.origin;
                 cur.target = resolved.target;
-                if (redirectRewritesToGet(status, cur.method)) {
-                    cur.method = .GET;
+                if (drop_body) {
+                    if (cur.method != .HEAD) cur.method = .GET;
                     cur.body = .none;
                 }
-                if (cross and !self.redirect.unrestricted_auth) {
+                const strip_credentials = cross and !self.redirect.unrestricted_auth;
+                if (strip_credentials or drop_body) {
+                    const headers = try redirectHeaders(self.gpa, cur.extra_headers, strip_credentials, drop_body);
                     if (hdr_buf) |h| self.gpa.free(h);
-                    hdr_buf = try stripSensitive(self.gpa, spec.extra_headers);
-                    cur.extra_headers = hdr_buf.?;
+                    hdr_buf = headers;
+                    cur.extra_headers = headers;
                 }
                 redirects += 1;
             }
@@ -730,21 +774,23 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// *reused* connection fails mid round-trip and the method is
         /// idempotent — that failure is almost always a server-side idle close,
         /// and no response reached the caller, so a fresh attempt is safe.
-        fn send(self: *Self, spec: RequestSpec, deadline: ?zio.Timestamp) !Response {
+        fn send(self: *Self, spec: RequestSpec, deadline: ?zio.Timestamp, head_budget: *conn_mod.ResponseHeadBudget) !Response {
             // Retry needs a re-sendable request: an idempotent method AND a
             // replayable body. A streaming upload is consumed on the first
             // attempt, so even an idempotent PUT with a stream body must not
             // retry (it would send an empty/short body the second time).
             const retryable = isIdempotent(spec.method) and spec.body.replayable();
             const timeouts = spec.timeouts orelse self.timeouts;
+            try Conn.timeout_capabilities.require(timeouts.read != .none or deadline != null, timeouts.write != .none or deadline != null);
             var attempt: u8 = 0;
             while (true) {
-                const co = try self.pool.checkout(spec.origin, cap(timeouts.connect, deadline));
+                if (head_budget.remaining == 0) return error.ResponseHeadersTooLarge;
+                const co = try self.pool.checkoutWithDeadline(spec.origin, cap(timeouts.connect, deadline), if (deadline) |ts| .{ .deadline = ts } else .none);
                 // Set true by roundtrip once the first response byte arrives.
                 // Past that point the server may have acted on the request, so
                 // the failure must not be replayed even on an idempotent method.
                 var received_response = false;
-                if (self.roundtrip(co.conn, spec, deadline, &received_response)) |resp| {
+                if (self.roundtrip(co.conn, spec, deadline, &received_response, head_budget)) |resp| {
                     return resp;
                 } else |err| {
                     // The round-trip failed before any Response escaped, so the
@@ -770,14 +816,11 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
 
         /// One attempt over an already-checked-out connection. On any error the
         /// connection is left for the caller to close (no checkin here).
-        fn roundtrip(self: *Self, conn: *Conn, spec: RequestSpec, deadline: ?zio.Timestamp, received_response: *bool) !Response {
+        fn roundtrip(self: *Self, conn: *Conn, spec: RequestSpec, deadline: ?zio.Timestamp, received_response: *bool, head_budget: *conn_mod.ResponseHeadBudget) !Response {
             const timeouts = spec.timeouts orelse self.timeouts;
-            // Host header: omit the port when it is the scheme default.
+            // URL/dial host is bare IPv6; bracket only its HTTP authority.
             var host_buf: [320]u8 = undefined;
-            const host_val = if (spec.origin.port == Origin.defaultPort(spec.origin.scheme))
-                spec.origin.host
-            else
-                try std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ spec.origin.host, spec.origin.port });
+            const host_val = try requestHost(spec.origin, &host_buf);
 
             // Framing follows the body shape: known-length bodies (bytes /
             // reader) get Content-Length; an unknown-length stream gets chunked.
@@ -788,7 +831,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 .chunked => .{ null, true },
             };
 
-            conn.setWriteTimeout(cap(timeouts.write, deadline));
+            try conn.setWriteTimeout(cap(timeouts.write, deadline));
             try conn.sendRequest(.{
                 .method = spec.method,
                 .target = spec.target,
@@ -811,7 +854,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // The read deadline stays set so the lazily streamed body inherits it
             // — and, being capped to the total deadline, the body read is bounded
             // by the whole-request budget too.
-            conn.setReadTimeout(cap(timeouts.read, deadline));
+            try conn.setReadTimeout(cap(timeouts.read, deadline));
             // Wait for the first response byte before committing to the parse.
             // A failure here (or above, in the write) means no response was
             // received, so an idempotent request was not processed and may be
@@ -820,7 +863,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             // have already acted on the request).
             try conn.reader().fill(1);
             received_response.* = true;
-            try conn.readResponse(self.max_response_body, self.decompress);
+            try conn.readResponseWithBudget(self.max_response_body, self.decompress, head_budget);
             return .{ .conn = conn, .pool = &self.pool };
         }
 
@@ -957,7 +1000,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                         if (self.stopped) return null; // 204
                     }
                     const ev = self.decoder.next() catch {
-                        self.endConnection();
+                        try self.endConnection();
                         if (!self.canRetry()) return null;
                         try self.backoff();
                         continue;
@@ -969,7 +1012,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                         return e;
                     }
                     // Clean EOF: the server closed the stream — reconnect.
-                    self.endConnection();
+                    try self.endConnection();
                     if (!self.canRetry()) return null;
                     try self.backoff();
                 }
@@ -980,10 +1023,12 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 var buf: [16]Header = undefined;
                 var headers: []const Header = self.spec.extra_headers;
                 if (self.last_id) |id| {
-                    if (self.spec.extra_headers.len + 1 > buf.len) return error.TooManyHeaders;
-                    @memcpy(buf[0..self.spec.extra_headers.len], self.spec.extra_headers);
-                    buf[self.spec.extra_headers.len] = .{ .name = "last-event-id", .value = id };
-                    headers = buf[0 .. self.spec.extra_headers.len + 1];
+                    if (id.len != 0) {
+                        if (self.spec.extra_headers.len + 1 > buf.len) return error.TooManyHeaders;
+                        @memcpy(buf[0..self.spec.extra_headers.len], self.spec.extra_headers);
+                        buf[self.spec.extra_headers.len] = .{ .name = "last-event-id", .value = id };
+                        headers = buf[0 .. self.spec.extra_headers.len + 1];
+                    }
                 }
 
                 const resp = try self.client.request(.{
@@ -1013,9 +1058,11 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
 
             // Force-closes the live connection without draining — an SSE body is
             // effectively infinite, so the pool must destroy it, not reuse it.
-            fn endConnection(self: *SseSource) void {
+            fn endConnection(self: *SseSource) !void {
+                defer self.closeCurrent();
                 self.server_retry_ms = self.decoder.reconnect_ms;
-                self.closeCurrent();
+                // An id-only block updates resume state even without an event.
+                if (self.decoder.last_id) |id| try self.setLastId(id);
             }
 
             fn closeCurrent(self: *SseSource) void {
@@ -1026,6 +1073,9 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             }
 
             fn setLastId(self: *SseSource, id: []const u8) !void {
+                // decoder may still borrow this owned id after reconnect. Do
+                // not free its backing storage when an event keeps the same id.
+                if (self.last_id) |old| if (std.mem.eql(u8, old, id)) return;
                 const dup = try self.client.gpa.dupe(u8, id);
                 if (self.last_id) |old| self.client.gpa.free(old);
                 self.last_id = dup;
@@ -1074,6 +1124,10 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// stream is not killed (liveness comes from ping/pong), the same
             /// stance as `SseSource`. Set it to bound an idle read.
             read_timeout: zio.Timeout = .none,
+            /// Admission for unfinished text/binary calls, not a payload queue.
+            send_limits: codec.ws.SendLimits = .{},
+            /// Optional data fragmentation; controls may run between fragments.
+            send_options: codec.ws.SendOptions = .{},
         };
 
         pub const WebSocketError = error{
@@ -1084,7 +1138,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             /// The caller's headers plus the handshake headers exceeded the
             /// fixed request-header buffer.
             TooManyHeaders,
-        };
+        } || codec.ws.SendOptions.Error;
 
         /// A live client-side WebSocket over a hijacked connection. Symmetric
         /// with the server's `WebSocket`: `read()` returns whole messages
@@ -1109,16 +1163,20 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 return self.session.read();
             }
 
-            pub fn writeText(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+            pub fn writeText(self: *WebSocketClient, data: []const u8) codec.ws.WriteError!void {
                 return self.session.writeText(data);
             }
 
-            pub fn writeBinary(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+            pub fn writeBinary(self: *WebSocketClient, data: []const u8) codec.ws.WriteError!void {
                 return self.session.writeBinary(data);
             }
 
+            pub fn sendStats(self: *WebSocketClient) codec.ws.SendStats {
+                return self.session.sendStats();
+            }
+
             /// Sends a ping (`data` ≤ 125 bytes).
-            pub fn writePing(self: *WebSocketClient, data: []const u8) std.Io.Writer.Error!void {
+            pub fn writePing(self: *WebSocketClient, data: []const u8) codec.ws.WriteError!void {
                 return self.session.writePing(data);
             }
 
@@ -1142,13 +1200,15 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
                 return self.conn.lastWriteCanceled();
             }
 
-            /// Sends a close frame (idempotent). The caller then stops reading.
-            pub fn close(self: *WebSocketClient, code: CloseCode, reason: []const u8) std.Io.Writer.Error!void {
+            /// Sends a close once; subsequent data/ping sends return Closed.
+            /// read may continue to await the peer's close.
+            pub fn close(self: *WebSocketClient, code: CloseCode, reason: []const u8) codec.ws.WriteError!void {
                 return self.session.close(code, reason);
             }
 
             /// Best-effort close, then destroys the connection (a WebSocket
             /// connection is never returned to the pool) and frees the buffer.
+            /// Join all concurrent operations first; deinit is not concurrent.
             pub fn deinit(self: *WebSocketClient) void {
                 self.session.close(.normal, "") catch {};
                 self.client.pool.checkin(self.conn, false);
@@ -1162,6 +1222,7 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
         /// was built with a TLS connector. Returns `error.HandshakeFailed` if the
         /// server's response is not a valid 101 upgrade.
         pub fn webSocket(self: *Self, spec: WebSocketSpec) !WebSocketClient {
+            try spec.send_options.validate();
             // A fresh random 16-byte nonce, base64-encoded (RFC 6455 §4.1). It
             // need only be unique per connection; `random` (the executor CSPRNG)
             // suffices and the value lives on this frame across the handshake.
@@ -1214,13 +1275,13 @@ pub fn ClientWith(comptime Connector: type, comptime mws: anytype) type {
             }
 
             // Hijack: keep the connection (do not deinit the Response, which
-            // would drain + pool it) and drive frames straight off its reader.
+            // would close it after a 101) and drive frames straight off its reader.
             const msg_buf = try self.gpa.alloc(u8, spec.max_message_size);
             const conn = resp.conn;
             return .{
                 .client = self,
                 .conn = conn,
-                .session = .{ .reader = conn.reader(), .writer = conn.writer(), .msg_buf = msg_buf },
+                .session = .{ .reader = conn.reader(), .writer = conn.writer(), .msg_buf = msg_buf, .send_limits = spec.send_limits, .send_options = spec.send_options },
                 .msg_buf = msg_buf,
             };
         }
@@ -1238,14 +1299,15 @@ test {
 
 // ── Redirect-resolution unit tests (pure; no network) ───────────────────────
 
-test "redirect: status + method-rewrite predicates" {
+test "redirect: status and body-drop predicates" {
     try std.testing.expect(isRedirectStatus(301) and isRedirectStatus(308));
     try std.testing.expect(!isRedirectStatus(200) and !isRedirectStatus(304));
-    // 303 always → GET; 301/302 only for POST; 307/308 never.
-    try std.testing.expect(redirectRewritesToGet(303, .GET));
-    try std.testing.expect(redirectRewritesToGet(302, .POST));
-    try std.testing.expect(!redirectRewritesToGet(302, .GET));
-    try std.testing.expect(!redirectRewritesToGet(307, .POST));
+    // 303 drops body for GET/HEAD; 301/302 only for POST; 307/308 never.
+    try std.testing.expect(redirectDropsBody(303, .GET));
+    try std.testing.expect(redirectDropsBody(303, .HEAD));
+    try std.testing.expect(redirectDropsBody(302, .POST));
+    try std.testing.expect(!redirectDropsBody(302, .GET));
+    try std.testing.expect(!redirectDropsBody(307, .POST));
 }
 
 test "parseAbsoluteUrl: scheme/host/port/target" {
@@ -1296,13 +1358,13 @@ test "hostFromOriginKey: extracts host for cookie attribution" {
     try std.testing.expect(hostFromOriginKey("") == null);
 }
 
-test "stripSensitive: drops auth/cookie, keeps the rest" {
+test "redirectHeaders: drops auth/cookie, keeps the rest" {
     const headers = [_]Header{
         .{ .name = "Authorization", .value = "Bearer x" },
         .{ .name = "Accept", .value = "*/*" },
         .{ .name = "cookie", .value = "a=b" },
     };
-    const out = try stripSensitive(std.testing.allocator, &headers);
+    const out = try redirectHeaders(std.testing.allocator, &headers, true, false);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("Accept", out[0].name);

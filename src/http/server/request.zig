@@ -12,6 +12,7 @@ const body_mod = @import("../codec/body.zig");
 const BodyReader = body_mod.BodyReader;
 const BodyError = body_mod.BodyError;
 const Header = parser.Header;
+const timeout_mod = @import("../../core/timeout.zig");
 
 /// Connection-upgrade handle, present on every request. A handler that speaks
 /// a post-HTTP protocol (WebSocket, …) calls `accept` to send the 101 and take
@@ -20,13 +21,15 @@ const Header = parser.Header;
 pub const Upgrade = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
-    /// Set true by `accept` so the protocol loop stops after the handler
-    /// returns. Points at a flag owned by the connection loop.
+    /// True once upgrade output is committed, including a write/flush failure
+    /// that may have emitted a prefix. The HTTP loop must not resume or send a
+    /// fallback. Only successful `accept` means the upgraded protocol is ready.
+    /// Points at a flag owned by the connection loop.
     taken: *bool,
     /// Type-erased read-timeout setter for the underlying transport (the only
     /// connection method not already reachable through the io interfaces).
     ctx: *anyopaque,
-    set_read_timeout_fn: *const fn (*anyopaque, zio.Timeout) void,
+    set_read_timeout_fn: *const fn (*anyopaque, zio.Timeout) timeout_mod.Error!void,
 
     pub const AcceptOptions = struct {
         /// Upgrade-header protocol token, e.g. "websocket".
@@ -40,18 +43,26 @@ pub const Upgrade = struct {
 
     /// Sends `101 Switching Protocols` and hands the connection to the caller.
     /// After this returns, use `reader`/`writer` for the upgraded protocol.
+    /// WriteFailed is terminal: close the connection rather than retrying.
+    /// InvalidHeader/timeout preparation failures leave output uncommitted.
+    /// AlreadyUpgraded rejects a second attempt before any side effects.
     pub fn accept(self: *Upgrade, options: AcceptOptions) !void {
-        try encode.writeUpgrade(self.writer, .{
+        if (self.taken.*) return error.AlreadyUpgraded;
+        try self.setReadTimeout(options.read_timeout);
+        encode.writeUpgrade(self.writer, .{
             .protocol = options.protocol,
             .extra_headers = options.extra_headers,
-        });
-        try self.writer.flush();
-        self.set_read_timeout_fn(self.ctx, options.read_timeout);
+        }) catch |err| {
+            // Header validation precedes all output; I/O failure may not.
+            if (err != error.InvalidHeader) self.taken.* = true;
+            return err;
+        };
         self.taken.* = true;
+        try self.writer.flush();
     }
 
-    pub fn setReadTimeout(self: *Upgrade, timeout: zio.Timeout) void {
-        self.set_read_timeout_fn(self.ctx, timeout);
+    pub fn setReadTimeout(self: *Upgrade, timeout: zio.Timeout) timeout_mod.Error!void {
+        try self.set_read_timeout_fn(self.ctx, timeout);
     }
 };
 
@@ -83,8 +94,8 @@ pub const Request = struct {
 
     /// The framing/limit failure recorded by the last body read, or null if
     /// none has failed. A body read returns the `error.ReadFailed` sentinel
-    /// and stashes the real cause here; `BodyTooLarge` (chunked body past
-    /// `limits.max_body_size`) lets a caller answer 413 instead of 400.
+    /// and stashes the real cause here; `BodyTooLarge` (payload or a declared
+    /// chunk exceeds `limits.max_body_size`) lets a caller answer 413.
     /// Oversized Content-Length bodies are rejected before the handler runs.
     pub fn bodyError(self: *const Request) ?BodyError {
         return self.body.err;
