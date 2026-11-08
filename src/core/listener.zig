@@ -16,6 +16,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const pipe_mod = @import("pipe.zig");
+const tcp_user_timeout = @import("tcp_user_timeout.zig");
 
 pub const Pipe = pipe_mod.Pipe;
 pub const PipeReader = pipe_mod.PipeReader;
@@ -70,14 +71,21 @@ pub const TcpListener = struct {
     pub const Options = struct {
         kernel_backlog: u31 = 128,
         reuse_address: bool = true,
+        /// Linux TCP_USER_TIMEOUT, inherited by accepted connections. Null
+        /// preserves OS policy; 0 restores its default. Separate from I/O deadlines.
+        tcp_user_timeout_ms: ?u31 = null,
     };
 
     pub fn listen(addr: zio.net.IpAddress, options: Options) !TcpListener {
-        const server = try addr.listen(.{
-            .kernel_backlog = options.kernel_backlog,
-            .reuse_address = options.reuse_address,
-        });
-        return .{ .server = server };
+        try tcp_user_timeout.validate(options.tcp_user_timeout_ms);
+        var socket = try zio.net.Socket.open(.stream, .fromPosix(addr.any.family), .ip);
+        errdefer socket.close();
+        if (options.reuse_address) try socket.setReuseAddress(true);
+        // Configure before listen: even children queued before accept inherit it.
+        try tcp_user_timeout.apply(socket, options.tcp_user_timeout_ms);
+        try socket.bind(.{ .ip = addr });
+        try socket.listen(options.kernel_backlog);
+        return .{ .server = .{ .socket = socket } };
     }
 
     pub fn accept(self: *TcpListener) !TcpConnection {

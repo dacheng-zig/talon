@@ -6,6 +6,17 @@
 //! connection middleware, buffer pool, and the framing toolbox.
 //!
 //!   Proto.serve(conn: *Connection(Raw), app: *App) anyerror!void
+//!   Proto.handshake(conn, app) !void   // optional; shares accept-time budget
+//!   Proto.Limits / engineLimits(limits) !core.Limits // optional policy mapping
+//!   Proto.serveWithConfig(conn, app, limits) !void    // optional configured entry
+//!   Proto.validateTransport(capabilities, limits) !void // optional pre-accept check
+//!
+//! Without policy mapping, Options.limits is core.Limits. Capacities and the
+//! connection limit are fixed at init; do not mutate options during serve.
+//!
+//! The engine runs middleware, optional handshake, then serve. Establishment
+//! deadlines end before serve; a protocol may cap its first-message timeout
+//! using conn.initialReadTimeout when negotiation occurs there instead.
 //!
 //! `Proto.serve` is a plain coroutine function: the protocol's connection loop
 //! is linear code, not an async state machine.
@@ -18,20 +29,104 @@ const chain_mod = @import("chain.zig");
 const buffer_pool = @import("buffer_pool.zig");
 
 pub const Limits = limits_mod.Limits;
+
+/// Per-connection inputs for adapters that own their protocol reader window.
+pub const WrapOptions = struct {
+    allocator: std.mem.Allocator,
+    deadline: zio.Timeout,
+    read_buffer_size: usize,
+};
 pub const Connection = connection.Connection;
 const BufferPool = buffer_pool.BufferPool;
 
 const log = std.log.scoped(.talon);
 
-// Size classes (one pool per purpose; a future tier generalizes this).
-const write_buffer_size = 4 * 1024;
-/// Read-buffer slack over max_header_size (codec/head.zig precondition).
-const head_buffer_slack = 1024;
-
 /// Backoff after `accept()` hits an fd-exhaustion error. A slow-handler burst
 /// can momentarily pin every fd; we pause rather than busy-spin retrying
 /// `accept()` (which would just keep failing and peg the executor).
 const accept_fd_backoff_ms = 10;
+
+/// Coherent connection-task snapshot; not physical socket or HTTP request counts.
+pub const ServerStats = struct {
+    accepted: u64 = 0,
+    active_tasks: usize = 0,
+    peak_active_tasks: usize = 0,
+    finished_tasks: u64 = 0,
+    waiting_for_permit: bool = false,
+    permit_wait_ns: u64 = 0,
+    transport_failures: u64 = 0,
+    buffer_failures: u64 = 0,
+    connection_errors: u64 = 0,
+    canceled_returns: u64 = 0,
+    handshake_timeouts: u64 = 0,
+    detached_connections: u64 = 0,
+    accept_fd_backoffs: u64 = 0,
+    accept_failures: u64 = 0,
+    task_spawn_failures: u64 = 0,
+    forced_drains: u64 = 0,
+    drain_timeouts: u64 = 0,
+};
+
+const Metrics = struct {
+    mutex: buffer_pool.SpinLock = .{},
+    value: ServerStats = .{},
+
+    fn snapshot(self: *Metrics) ServerStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.value;
+    }
+    fn start(self: *Metrics) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.value.accepted += 1;
+        self.value.active_tasks += 1;
+        self.value.peak_active_tasks = @max(self.value.peak_active_tasks, self.value.active_tasks);
+    }
+    fn finish(self: *Metrics, detached: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.value.active_tasks != 0);
+        self.value.active_tasks -= 1;
+        self.value.finished_tasks += 1;
+        if (detached) self.value.detached_connections += 1;
+    }
+    fn beginWait(self: *Metrics) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.value.waiting_for_permit = true;
+    }
+    fn endWait(self: *Metrics, elapsed: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.value.waiting_for_permit = false;
+        self.value.permit_wait_ns +|= elapsed;
+    }
+    fn increment(self: *Metrics, comptime field: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        @field(self.value, field) += 1;
+    }
+    fn taskError(self: *Metrics, comptime field: []const u8, err: anyerror) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (err == error.Canceled) {
+            self.value.canceled_returns += 1;
+        } else {
+            @field(self.value, field) += 1;
+            if (err == error.HandshakeTimeout) self.value.handshake_timeouts += 1;
+        }
+    }
+};
+
+const PlainTransport = struct {
+    pub fn Connection(comptime Raw: type) type {
+        return Raw;
+    }
+    pub fn wrap(_: *@This(), raw: anytype, _: std.mem.Allocator, _: zio.Timeout) !@TypeOf(raw) {
+        return raw;
+    }
+};
 
 /// StreamServer without connection middleware.
 pub fn StreamServer(comptime Proto: type, comptime App: type) type {
@@ -40,9 +135,10 @@ pub fn StreamServer(comptime Proto: type, comptime App: type) type {
 
 /// StreamServer with a comptime connection middleware chain. Each
 /// middleware is `fn (conn: *Connection, next: anytype) !void` (or a struct
-/// type with `run`); it may inspect/wrap the connection, publish remote
+/// type with `run`); it may inspect the connection, publish remote
 /// identity, or reject by returning without calling next.
 pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middlewares: anytype) type {
+    const Policy = if (@hasDecl(Proto, "Limits")) Proto.Limits else Limits;
     comptime {
         if (!@hasDecl(Proto, "serve")) {
             @compileError("talon.StreamServer: Proto type '" ++ @typeName(Proto) ++
@@ -53,45 +149,53 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
     return struct {
         gpa: std.mem.Allocator,
         app: *App,
-        limits: Limits,
+        limits: Policy,
+        engine_limits: Limits,
         group: zio.Group = .init,
         conn_sem: zio.Semaphore,
         shutting_down: std.atomic.Value(bool) = .init(false),
         shutdown_requested: std.atomic.Value(bool) = .init(false),
         stop_event: zio.ResetEvent = .init,
         accept_error: ?anyerror = null,
-        /// Read buffers double as the head accumulation window, so they are
-        /// sized to limits.max_header_size (16K default — read class).
+        /// Independent pool capacities, chosen by the protocol or caller.
         read_pool: BufferPool,
         write_pool: BufferPool,
+        metrics: Metrics = .{},
 
         const Self = @This();
+        pub const Stats = ServerStats;
+
+        /// Thread-safe, coherent lifecycle snapshot. No I/O or allocation.
+        /// active_tasks includes raw cleanup; detached raw is externally owned.
+        pub fn stats(self: *Self) Stats {
+            return self.metrics.snapshot();
+        }
 
         pub const Options = struct {
-            limits: Limits = .{},
+            limits: Policy = .{},
         };
 
+        fn engineLimits(policy: Policy) !Limits {
+            const engine = if (comptime @hasDecl(Proto, "engineLimits")) try Proto.engineLimits(policy) else policy;
+            try engine.validate();
+            return engine;
+        }
+
         pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Self {
-            if (options.limits.min_body_data_rate) |rate| {
-                if (rate.bytes_per_sec == 0 or rate.grace.toNanoseconds() == 0) return error.InvalidDataRate;
-            }
+            const engine = try engineLimits(options.limits);
             var read_pool = try BufferPool.init(gpa, .{
-                // Slack over max_header_size so the head scanner trips its
-                // "> max_header_size" guard before the buffer fills — sizing
-                // the buffer EQUAL to the limit would let a full-buffer head
-                // with no terminator hit fillMore on a full buffer (panic /
-                // spin). See codec/head.zig precondition.
-                .buffer_size = @max(options.limits.max_header_size, 1024) + head_buffer_slack,
+                .buffer_size = engine.read_buffer_size,
             });
             errdefer read_pool.deinit();
             const write_pool = try BufferPool.init(gpa, .{
-                .buffer_size = write_buffer_size,
+                .buffer_size = engine.write_buffer_size,
             });
             return .{
                 .gpa = gpa,
                 .app = app,
                 .limits = options.limits,
-                .conn_sem = .{ .permits = options.limits.max_connections },
+                .engine_limits = engine,
+                .conn_sem = .{ .permits = engine.max_connections },
                 .read_pool = read_pool,
                 .write_pool = write_pool,
             };
@@ -102,6 +206,14 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         pub fn deinit(self: *Self) void {
             self.read_pool.deinit();
             self.write_pool.deinit();
+        }
+
+        /// Frees snapshots of idle read/write buffers without touching active
+        /// connections. May run during serve(); not concurrently with deinit().
+        /// Returns freed payload bytes; the two snapshots are independent.
+        pub fn trimIdleBuffers(self: *Self) usize {
+            const read_bytes = self.read_pool.trimIdle();
+            return read_bytes +| self.write_pool.trimIdle();
         }
 
         /// Runs the server. Blocks the calling coroutine until shutdown() is
@@ -116,10 +228,36 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         /// listener fd does NOT wake a parked accept on all platforms
         /// (observed on macOS/kqueue).
         pub fn serve(self: *Self, listener: anytype) !void {
-            const L = ListenerType(@TypeOf(listener));
-            comptime validateListener(L);
+            var adapter: PlainTransport = .{};
+            return self.serveAdapted(listener, &adapter);
+        }
 
-            var accept_task = try zio.spawn(AcceptLoop(L).run, .{ self, listener });
+        /// Adapter.Connection(Raw) chooses the final static transport type.
+        /// wrapWithOptions(raw, options), or legacy wrap(raw, gpa, deadline),
+        /// runs in the tracked task. Options carries the engine reader window.
+        /// Success transfers raw ownership; failure leaves raw engine-owned.
+        /// Adapter and its configuration must outlive this blocking call.
+        pub fn serveAdapted(self: *Self, listener: anytype, adapter: anytype) !void {
+            const L = ListenerType(@TypeOf(listener));
+            const A = AdapterType(@TypeOf(adapter));
+            const Wrapped = A.Connection(L.RawConnection);
+            comptime validateListener(L);
+            const engine = try engineLimits(self.limits);
+            // Allocated pools and admission permits are fixed by init.
+            if (engine.read_buffer_size != self.read_pool.buffer_size or
+                engine.write_buffer_size != self.write_pool.buffer_size or
+                engine.max_connections != self.engine_limits.max_connections)
+                return error.ResourceLimitsChanged;
+            self.engine_limits = engine;
+            if (comptime !Connection(Wrapped).supports_timeouts) {
+                if (engine.handshake_timeout != .none) return error.HandshakeTimeoutUnsupported;
+            }
+            if (comptime @hasDecl(Proto, "validateTransport"))
+                try Proto.validateTransport(Connection(Wrapped).timeout_capabilities, self.limits);
+            if (comptime @hasDecl(A, "validateTransport"))
+                try adapter.validateTransport(Connection(L.RawConnection).timeout_capabilities, engine);
+
+            var accept_task = try zio.spawn(AcceptLoop(L, A).run, .{ self, listener, adapter });
 
             // Woken by shutdown() or by the accept loop exiting on its own.
             self.stop_event.wait() catch {};
@@ -142,13 +280,19 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
             self.stop_event.set();
         }
 
-        fn AcceptLoop(comptime L: type) type {
+        fn AcceptLoop(comptime L: type, comptime A: type) type {
             return struct {
-                fn run(server: *Self, listener: *L) void {
+                fn run(server: *Self, listener: *L, adapter: *A) void {
                     defer server.stop_event.set();
 
                     while (true) {
-                        server.conn_sem.wait() catch return;
+                        server.metrics.beginWait();
+                        var wait_clock = zio.Stopwatch.start();
+                        server.conn_sem.wait() catch {
+                            server.metrics.endWait(wait_clock.read().toNanoseconds());
+                            return;
+                        };
+                        server.metrics.endWait(wait_clock.read().toNanoseconds());
 
                         const raw = listener.accept() catch |err| {
                             server.conn_sem.post();
@@ -165,6 +309,7 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
                                 error.ProcessFdQuotaExceeded,
                                 error.SystemFdQuotaExceeded,
                                 => {
+                                    server.metrics.increment("accept_fd_backoffs");
                                     log.warn("accept: fd limit reached ({t}); backing off {d}ms", .{ err, accept_fd_backoff_ms });
                                     zio.sleep(zio.Duration.fromMilliseconds(accept_fd_backoff_ms)) catch return;
                                     continue;
@@ -172,16 +317,23 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
                                 // Anything else is a fatal listener failure;
                                 // surface it from serve() after the drain.
                                 else => {
+                                    server.metrics.increment("accept_failures");
                                     server.accept_error = err;
                                     return;
                                 },
                             }
                         };
 
-                        server.group.spawn(ConnTask(L.RawConnection).run, .{ server, raw }) catch |err| {
+                        server.metrics.start();
+                        const deadline = server.engine_limits.handshake_timeout.toDeadline();
+                        server.group.spawn(ConnTask(L.RawConnection, A).run, .{ server, raw, deadline, adapter }) catch |err| {
                             raw.close();
+                            server.metrics.finish(false);
                             server.conn_sem.post();
-                            if (err != error.Canceled) server.accept_error = err;
+                            if (err != error.Canceled) {
+                                server.metrics.increment("task_spawn_failures");
+                                server.accept_error = err;
+                            }
                             return;
                         };
                     }
@@ -192,12 +344,15 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
         fn drain(self: *Self) void {
             var done: zio.ResetEvent = .init;
             var handle = zio.spawn(drainWaiter, .{ &self.group, &done }) catch {
+                self.metrics.increment("forced_drains");
                 self.group.cancel();
                 return;
             };
             defer _ = handle.join();
 
-            done.timedWait(self.limits.drain_timeout) catch {
+            done.timedWait(self.engine_limits.drain_timeout) catch |err| {
+                self.metrics.increment("forced_drains");
+                if (err == error.Timeout) self.metrics.increment("drain_timeouts");
                 // Drain timeout: hard-cancel stragglers. In-progress writes
                 // are shield-protected inside zio where applicable.
                 self.group.cancel();
@@ -209,57 +364,115 @@ pub fn StreamServerWith(comptime Proto: type, comptime App: type, comptime middl
             done.set();
         }
 
-        fn ConnTask(comptime Raw: type) type {
-            const Conn = Connection(Raw);
+        fn ConnTask(comptime Raw: type, comptime A: type) type {
+            const Wrapped = A.Connection(Raw);
+            const Conn = Connection(Wrapped);
             const ConnChain = chain_mod.chain(Conn, middlewares);
 
             const ProtoTerminal = struct {
-                app: *App,
+                server: *Self,
                 pub fn call(self: @This(), conn: *Conn) anyerror!void {
-                    return Proto.serve(conn, self.app);
+                    try conn.checkEstablishmentDeadline();
+                    if (comptime @hasDecl(Proto, "handshake")) try Proto.handshake(conn, self.server.app);
+                    try conn.finishEstablishment();
+                    if (comptime @hasDecl(Proto, "serveWithConfig"))
+                        return Proto.serveWithConfig(conn, self.server.app, self.server.limits);
+                    return Proto.serve(conn, self.server.app);
                 }
             };
 
             return struct {
-                fn run(server: *Self, raw: Raw) void {
+                fn prepareTransport(adapter: *A, raw: Raw, gpa: std.mem.Allocator, deadline: zio.Timeout, read_buffer_size: usize) !Wrapped {
+                    try zio.checkCancel();
+                    if (deadline == .deadline and
+                        zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline.deadline.toNanoseconds())
+                        return error.HandshakeTimeout;
+                    if (comptime @hasDecl(A, "wrapWithOptions")) {
+                        return adapter.wrapWithOptions(raw, .{ .allocator = gpa, .deadline = deadline, .read_buffer_size = read_buffer_size });
+                    } else {
+                        return adapter.wrap(raw, gpa, deadline);
+                    }
+                }
+
+                fn run(server: *Self, accepted: Raw, deadline: zio.Timeout, adapter: *A) void {
                     defer server.conn_sem.post();
-
-                    const read_buffer = server.read_pool.rent() catch {
-                        raw.close();
+                    var detached = false;
+                    defer server.metrics.finish(detached);
+                    const raw = prepareTransport(adapter, accepted, server.gpa, deadline, server.engine_limits.read_buffer_size) catch |err| {
+                        server.metrics.taskError("transport_failures", err);
+                        accepted.shutdown();
+                        accepted.close();
+                        if (err != error.Canceled and err != error.ReadFailed and err != error.WriteFailed and err != error.HandshakeTimeout)
+                            log.warn("transport setup error: {t}", .{err});
                         return;
                     };
-                    defer server.read_pool.give(read_buffer);
-                    const write_buffer = server.write_pool.rent() catch {
+
+                    const read_buffer = if (Conn.uses_pooled_buffers) server.read_pool.rent() catch {
+                        server.metrics.increment("buffer_failures");
                         raw.close();
                         return;
-                    };
-                    defer server.write_pool.give(write_buffer);
-
-                    var arena = std.heap.ArenaAllocator.init(server.gpa);
-                    defer arena.deinit();
+                    } else &.{};
+                    defer if (Conn.uses_pooled_buffers) server.read_pool.give(read_buffer);
+                    const write_buffer = if (Conn.uses_pooled_buffers) server.write_pool.rent() catch {
+                        server.metrics.increment("buffer_failures");
+                        raw.close();
+                        return;
+                    } else &.{};
+                    defer if (Conn.uses_pooled_buffers) server.write_pool.give(write_buffer);
 
                     var conn = Conn.init(
                         raw,
                         read_buffer,
                         write_buffer,
-                        &server.limits,
+                        &server.engine_limits,
                         &server.shutting_down,
-                        &arena,
+                        server.gpa,
                     );
-                    // Hijacked connections become the hijacker's to close;
-                    // note the pooled buffers still return above, so a
-                    // hijacker must re-buffer (current hijack contract).
-                    defer if (!conn.hijacked) {
-                        raw.shutdown();
-                        raw.close();
+                    // Only successful checked detachment transfers raw close;
+                    // pooled buffers and permit remain task-owned.
+                    defer {
+                        detached = conn.raw_detached;
+                        if (!detached) {
+                            raw.shutdown();
+                            raw.close();
+                        }
+                    }
+                    conn.beginEstablishment(deadline) catch |err| {
+                        server.metrics.taskError("connection_errors", err);
+                        return;
                     };
 
-                    ConnChain.run(&conn, ProtoTerminal{ .app = server.app }) catch |err| switch (err) {
-                        // Routine connection terminations (cancel during
-                        // drain, peer reset/timeout) are not server faults.
-                        error.Canceled, error.ReadFailed, error.WriteFailed, error.EndOfStream, error.BodyTooSlow => {},
-                        else => log.warn("connection handler error: {t} (peer: {f})", .{ err, raw.remoteInfo() }),
+                    ConnChain.run(&conn, ProtoTerminal{ .server = server }) catch |err| {
+                        server.metrics.taskError("connection_errors", err);
+                        switch (err) {
+                            // Routine connection terminations (cancel during
+                            // drain, peer reset/timeout) are not server faults.
+                            error.Canceled, error.ReadFailed, error.WriteFailed, error.EndOfStream, error.BodyTooSlow, error.HandshakeTimeout => {},
+                            else => log.warn("connection handler error: {t} (peer: {f})", .{ err, conn.remoteInfo() }),
+                        }
+                        return;
                     };
+                    if (comptime @hasDecl(A, "finish")) {
+                        // Successful chain completion is the only normal-end
+                        // signal. A detached transport may already be freed.
+                        if (!conn.raw_detached) {
+                            // zio cancellation errors are consumable: a handler
+                            // may catch one and still return success during drain.
+                            if (server.group.isCanceled()) {
+                                server.metrics.taskError("connection_errors", error.Canceled);
+                                return;
+                            }
+                            zio.checkCancel() catch |err| {
+                                server.metrics.taskError("connection_errors", err);
+                                return;
+                            };
+                            adapter.finish(raw) catch |err| {
+                                server.metrics.taskError("connection_errors", err);
+                                if (err != error.Canceled and err != error.ReadFailed and err != error.WriteFailed and err != error.Timeout)
+                                    log.warn("transport finish error: {t} (peer: {f})", .{ err, conn.remoteInfo() });
+                            };
+                        }
+                    }
                 }
             };
         }
@@ -273,6 +486,18 @@ fn ListenerType(comptime P: type) type {
             @typeName(P));
     }
     return info.pointer.child;
+}
+
+fn AdapterType(comptime P: type) type {
+    const info = @typeInfo(P);
+    if (info != .pointer or info.pointer.size != .one)
+        @compileError("talon.StreamServer.serveAdapted: adapter must be a pointer to one adapter");
+    const A = info.pointer.child;
+    if (!@hasDecl(A, "Connection"))
+        @compileError("talon.StreamServer.serveAdapted: adapter is missing 'Connection'");
+    if (!@hasDecl(A, "wrapWithOptions") and !@hasDecl(A, "wrap"))
+        @compileError("talon.StreamServer.serveAdapted: adapter needs 'wrapWithOptions' or 'wrap'");
+    return A;
 }
 
 fn validateListener(comptime L: type) void {

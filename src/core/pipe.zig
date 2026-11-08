@@ -42,8 +42,10 @@ pub const Pipe = struct {
         try self.mutex.lock();
         defer self.mutex.unlock();
 
-        while (self.count == 0) {
-            if (self.write_closed or self.read_closed) return 0;
+        while (true) {
+            if (self.read_closed) return 0;
+            if (self.count > 0) break;
+            if (self.write_closed) return 0;
             try self.readable.waitTimeout(&self.mutex, deadline);
         }
 
@@ -110,7 +112,8 @@ pub const Pipe = struct {
         self.writable.broadcast();
     }
 
-    /// Closes the read end. Subsequent writes fail with error.BrokenPipe.
+    /// Closes the read end. Subsequent pipe reads return EOF even with buffered
+    /// bytes; subsequent writes fail with error.BrokenPipe.
     pub fn closeRead(self: *Pipe) void {
         self.mutex.lockUncancelable();
         defer self.mutex.unlock();
@@ -315,7 +318,7 @@ test "Pipe: blocking write resumes when reader drains; EOF after closeWrite" {
     try std.testing.expectEqualStrings("abcdefgh", out.items);
 }
 
-test "Pipe: write after closeRead fails with BrokenPipe" {
+test "Pipe: closeRead stops buffered reads and rejects writes" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
 
@@ -324,7 +327,16 @@ test "Pipe: write after closeRead fails with BrokenPipe" {
 
     const Fns = struct {
         fn run(p: *Pipe) !void {
+            try p.writeAll("data");
             p.closeRead();
+            p.closeRead();
+            var dest: [4]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 0), try p.read(&dest));
+            try std.testing.expectEqual(@as(usize, 0), try p.readTimeout(&dest, .fromMilliseconds(10)));
+            var reader_buffer: [1]u8 = undefined;
+            var reader = PipeReader.init(p, &reader_buffer);
+            try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
+            try std.testing.expectEqual(null, reader.err);
             try std.testing.expectError(error.BrokenPipe, p.write("x"));
         }
     };

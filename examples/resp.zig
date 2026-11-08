@@ -30,7 +30,7 @@ const RespEchoProto = struct {
         while (true) {
             // Request-boundary idle wait: lets shutdown interrupt idle
             // connections instead of waiting out the drain timeout.
-            conn.waitReadable(conn.limits.keep_alive_timeout) catch return;
+            conn.waitReadable(.fromSeconds(75)) catch return;
 
             const line = lines.next() catch |err| switch (err) {
                 error.PartialFrame => return, // peer vanished mid-line
@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     var listener = try core.TcpListener.listen(addr, .{});
 
     var app: App = .{};
-    var server = try Server.init(init.gpa, &app, .{});
+    var server = try Server.init(init.gpa, &app, .{ .limits = .{ .read_buffer_size = 1024, .write_buffer_size = 1024 } });
     defer server.deinit();
 
     var group: zio.Group = .init;

@@ -1,8 +1,8 @@
 //! Built-in connection middleware.
 //!
 //! Middleware signature: `fn (conn: *Connection, next: anytype) !void` —
-//! around-style; not calling next rejects the connection. TLS will be one
-//! of these once implemented; PROXY protocol and logging already are.
+//! around-style; not calling next rejects the connection. TLS is a transport
+//! adapter used with serveAdapted; PROXY protocol and logging are middleware.
 
 const std = @import("std");
 const zio = @import("zio");
