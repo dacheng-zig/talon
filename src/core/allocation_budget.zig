@@ -154,7 +154,7 @@ test "AllocationBudget: resize/remap growth rejection and shrink keep exact requ
     try std.testing.expectEqual(null, a.remap(block, 65));
     try std.testing.expectEqual(@as(usize, 32), budget.stats().reserved_bytes);
     block = a.remap(block, 64).?;
-    try std.testing.expectEqualStrings("x" ** 16, block[0..16]);
+    try std.testing.expectEqualStrings(&@as([16]u8, @splat('x')), block[0..16]);
     try std.testing.expectEqual(@as(usize, 64), budget.stats().reserved_bytes);
     try std.testing.expect(a.resize(block, 8));
     block = block.ptr[0..8];
@@ -189,11 +189,11 @@ test "AllocationBudget: realloc fallback must cover old and new allocations unti
     @memset(block, 'x');
     try std.testing.expectError(error.OutOfMemory, a.realloc(block, 48));
     try std.testing.expectEqual(@as(usize, 40), budget.stats().reserved_bytes);
-    try std.testing.expectEqualStrings("x" ** 40, block);
+    try std.testing.expectEqualStrings(&@as([40]u8, @splat('x')), block);
     block = try a.realloc(block, 24);
     try std.testing.expectEqual(@as(usize, 24), budget.stats().reserved_bytes);
     try std.testing.expectEqual(@as(usize, 64), budget.stats().peak_reserved_bytes);
-    try std.testing.expectEqualStrings("x" ** 24, block);
+    try std.testing.expectEqualStrings(&@as([24]u8, @splat('x')), block);
     a.free(block);
 }
 

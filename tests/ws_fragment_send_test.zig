@@ -95,7 +95,7 @@ test "WS fragments: slow output lets ping and automatic pong interrupt ordered d
             var entered_read: zio.ResetEvent = .init;
             const F = struct {
                 fn first(s: *S) !void {
-                    try s.writeBinary(&([_]u8{'a'} ** 2500));
+                    try s.writeBinary(&(@as([2500]u8, @splat('a'))));
                 }
                 fn canceled(s: *S) !void {
                     try std.testing.expectError(error.Canceled, s.writeText("canceled"));
@@ -216,7 +216,7 @@ test "WS fragments: cancellation immediately after a complete non-final flush is
             var session: S = .{ .reader = &input, .writer = &output.interface, .msg_buf = &.{}, .send_options = .{ .max_frame_payload = 64 } };
             const F = struct {
                 fn send(s: *S) !void {
-                    try std.testing.expectError(error.Canceled, s.writeBinary(&([_]u8{'x'} ** 140)));
+                    try std.testing.expectError(error.Canceled, s.writeBinary(&(@as([140]u8, @splat('x')))));
                 }
             };
             var sender = try zio.spawn(F.send, .{&session});
@@ -248,7 +248,7 @@ test "WS fragments: a partial first frame fails terminally and releases admissio
         var session: S = .{ .reader = &input, .writer = &writer.interface, .msg_buf = &.{}, .send_options = .{ .max_frame_payload = 64 } };
         const F = struct {
             fn send(s: *S) !void {
-                try std.testing.expectError(error.WriteFailed, s.writeBinary(&([_]u8{'a'} ** 140)));
+                try std.testing.expectError(error.WriteFailed, s.writeBinary(&(@as([140]u8, @splat('a')))));
             }
         };
         var sender = try zio.spawn(F.send, .{&session});
@@ -301,7 +301,7 @@ test "WS fragments: close interrupts at a frame boundary without poisoning autom
             var entered: zio.ResetEvent = .init;
             const F = struct {
                 fn send(s: *S) !void {
-                    try std.testing.expectError(error.Closed, s.writeBinary(&([_]u8{'a'} ** 2500)));
+                    try std.testing.expectError(error.Closed, s.writeBinary(&(@as([2500]u8, @splat('a')))));
                 }
                 fn close(s: *S, ready: *zio.ResetEvent) !void {
                     ready.set();
@@ -423,7 +423,7 @@ test "WS fragments: controlled slow-output comparison measures data preceding a 
                 var preceding: usize = 0;
                 const F = struct {
                     fn send(s: *S) !void {
-                        try s.writeBinary(&([_]u8{'a'} ** 2500));
+                        try s.writeBinary(&(@as([2500]u8, @splat('a'))));
                     }
                     fn ping(s: *S, ready: *zio.ResetEvent) !void {
                         ready.set();
@@ -545,11 +545,11 @@ test "WS fragments: cancellation waiting behind a control frame joins cleanup be
             const F = struct {
                 fn send(s: *S, ended: *zio.ResetEvent) anyerror!void {
                     defer ended.set();
-                    try std.testing.expectError(error.Canceled, s.writeBinary(&([_]u8{'a'} ** 2500)));
+                    try std.testing.expectError(error.Canceled, s.writeBinary(&(@as([2500]u8, @splat('a')))));
                 }
                 fn ping(s: *S, ready: *zio.ResetEvent) !void {
                     ready.set();
-                    try s.writePing(&([_]u8{'p'} ** 125));
+                    try s.writePing(&(@as([125]u8, @splat('p'))));
                 }
                 fn cancel(sender: *zio.JoinHandle(anyerror!void), requested: *zio.ResetEvent) void {
                     requested.set();
@@ -589,7 +589,7 @@ test "WS fragments: cancellation waiting behind a control frame joins cleanup be
             try std.testing.expect(control.fin and control.payload_len == 125);
             try peer.interface.readSliceAll(&payload);
             if (control.masked) ws.unmask(&payload, control.mask_key);
-            try std.testing.expectEqualSlices(u8, &([_]u8{'p'} ** 125), &payload);
+            try std.testing.expectEqualSlices(u8, &(@as([125]u8, @splat('p'))), &payload);
             try ping.join();
             canceller.join();
             try sender.join();

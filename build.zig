@@ -135,7 +135,7 @@ pub fn build(b: *std.Build) void {
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
         // Forward args after `--`, e.g. `zig build run-http_get -- http://host/`.
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
         const run_step = b.step(b.fmt("run-{s}", .{ex.name}), b.fmt("Run the {s} example", .{ex.name}));
         run_step.dependOn(&run_cmd.step);
     }

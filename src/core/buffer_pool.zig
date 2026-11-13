@@ -14,7 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const track_borrows = builtin.mode == .Debug;
+const track_borrows = builtin.mode == .debug;
 
 const log = std.log.scoped(.talon);
 
@@ -158,7 +158,7 @@ test "BufferPool: trimming idle storage restores shared budget without invalidat
         defer a.free(fill);
         try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 512));
         try std.testing.expectEqual(@as(usize, 512), pool.trimIdle());
-        try std.testing.expectEqualStrings("x" ** 512, live);
+        try std.testing.expectEqualStrings(&@as([512]u8, @splat('x')), live);
         const recovered = try a.alloc(u8, 512);
         a.free(recovered);
         pool.give(live);

@@ -47,7 +47,7 @@ test "allocation budget: idle pool storage and retained frames consume the same 
         pool.give(block);
         try std.testing.expectEqual(live_pool, budget.stats().reserved_bytes);
         const Frames = core.framing.OwnedLengthPrefixed(.{ .length_type = u16, .max_frame = 2000 });
-        const data = "\x07\xd0" ++ ("x" ** 2000);
+        const data = "\x07\xd0" ++ (&@as([2000]u8, @splat('x')));
         var first_reader = std.Io.Reader.fixed(data);
         var first_decoder = Frames.init(&first_reader, a);
         var first = (try first_decoder.next()).?;
@@ -110,7 +110,7 @@ test "allocation budget: concurrent server frames reject excess, release admissi
                 var first_writer = first.writer(&.{});
                 first_writer.setTimeout(.fromSeconds(2));
                 try first_writer.interface.writeInt(u32, 48 * 1024, .big);
-                try first_writer.interface.writeAll("x" ** (48 * 1024));
+                try first_writer.interface.writeAll(&@as([(48 * 1024)]u8, @splat('x')));
                 try app_state.held.timedWait(.fromSeconds(2));
                 const excess = try l.connect();
                 defer excess.close();

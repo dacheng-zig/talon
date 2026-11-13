@@ -1,9 +1,9 @@
 # Zig TLS Client compatibility source
 
-`tls_client.zig` is copied from the installed Zig 0.16.0 distribution's
+`tls_client.zig` is copied from the installed Zig 0.17.1 distribution's
 `lib/std/crypto/tls/Client.zig`. Upstream project: https://github.com/ziglang/zig.
 The original file SHA-256 is
-`1464bd0d53f799e7714fa073a0783cb94c68c10fb1ab4381246e01f9cb130c8a`.
+`c6fbf80138bcf5cf5e46090294e94159815e2e175df56256679ddec87cf64d2c`.
 Copyright Zig contributors; MIT license is preserved in `LICENSE`.
 
 Local changes are limited to:

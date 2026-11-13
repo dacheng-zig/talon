@@ -1,6 +1,6 @@
 # talon
 
-基于 Zig 0.16 和 zio 的网络开发引擎。`talon.core` 提供协议无关的流式连接引擎、TCP/内存传输、连接中间件和拆帧工具；`talon.http` 提供 HTTP/1.1 服务端、客户端、WebSocket 与 SSE。
+基于 Zig 0.17 和 zio 的网络开发引擎。`talon.core` 提供协议无关的流式连接引擎、TCP/内存传输、连接中间件和拆帧工具；`talon.http` 提供 HTTP/1.1 服务端、客户端、WebSocket 与 SSE。
 
 ```sh
 zig build test

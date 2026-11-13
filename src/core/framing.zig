@@ -316,7 +316,7 @@ const FragmentedReader = struct {
 };
 
 test "OwnedLengthPrefixed: fragmented large payloads outlive subsequent reads through tiny windows" {
-    const data = "\x00\x00\x10\x00" ++ ("x" ** 4096) ++ "\x00\x00\x00\x03end" ++ "\x00\x00\x00\x00";
+    const data = "\x00\x00\x10\x00" ++ (&@as([4096]u8, @splat('x'))) ++ "\x00\x00\x00\x03end" ++ "\x00\x00\x00\x00";
     for ([_]usize{ 0, 1, 7 }) |capacity| {
         var buffer: [7]u8 = undefined;
         var r = FragmentedReader.init(data, buffer[0..capacity]);
@@ -328,7 +328,7 @@ test "OwnedLengthPrefixed: fragmented large payloads outlive subsequent reads th
         defer second.deinit();
         var empty = (try frames.next()).?;
         defer empty.deinit();
-        try std.testing.expectEqualStrings("x" ** 4096, first.payload);
+        try std.testing.expectEqualStrings(&@as([4096]u8, @splat('x')), first.payload);
         try std.testing.expectEqualStrings("end", second.payload);
         try std.testing.expectEqual(@as(usize, 0), empty.payload.len);
         try std.testing.expectEqual(@as(usize, 4099), counted.allocated_bytes);
@@ -440,7 +440,7 @@ test "LengthPrefixed: little-endian and includes_header" {
 }
 
 test "LengthPrefixed: rejects oversized frame" {
-    const data = "\x00\xff" ++ ("x" ** 255);
+    const data = "\x00\xff" ++ (&@as([255]u8, @splat('x')));
     var r: std.Io.Reader = .fixed(data);
     var framed = LengthPrefixed(.{ .length_type = u16, .max_frame = 16 }).init(&r);
     try std.testing.expectError(error.FrameTooLarge, framed.next());
@@ -483,7 +483,7 @@ test "Delimited: trailing bytes without delimiter are a PartialFrame" {
 }
 
 test "Delimited: line over max_frame is rejected" {
-    const data = ("y" ** 100) ++ "\r\n";
+    const data = (&@as([100]u8, @splat('y'))) ++ "\r\n";
     var r: std.Io.Reader = .fixed(data);
     var lines = Delimited(.{ .delimiter = "\r\n", .max_frame = 32 }).init(&r);
     try std.testing.expectError(error.FrameTooLarge, lines.next());

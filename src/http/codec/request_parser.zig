@@ -64,7 +64,7 @@ pub const ParseError = error{
 
 // RFC 9110 token characters.
 const tchar_table = blk: {
-    var t = [_]bool{false} ** 256;
+    var t = @as([256]bool, @splat(false));
     for ("!#$%&'*+-.^_`|~") |c| t[c] = true;
     for ('0'..'9' + 1) |c| t[c] = true;
     for ('a'..'z' + 1) |c| t[c] = true;
@@ -74,7 +74,7 @@ const tchar_table = blk: {
 
 // field-content: VCHAR (0x21-0x7E), obs-text (0x80-0xFF), SP, HTAB.
 const fieldchar_table = blk: {
-    var t = [_]bool{false} ** 256;
+    var t = @as([256]bool, @splat(false));
     t[' '] = true;
     t['\t'] = true;
     for (0x21..0x7F) |c| t[c] = true;
@@ -84,7 +84,7 @@ const fieldchar_table = blk: {
 
 // request-target: VCHAR + obs-text, no SP/HTAB/controls.
 const targetchar_table = blk: {
-    var t = [_]bool{false} ** 256;
+    var t = @as([256]bool, @splat(false));
     for (0x21..0x7F) |c| t[c] = true;
     for (0x80..0x100) |c| t[c] = true;
     break :blk t;

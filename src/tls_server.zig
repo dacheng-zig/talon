@@ -536,9 +536,9 @@ test "TLS ALPN owns opaque identifiers and selects server preference without NPN
 
 test "TLS ALPN rejects invalid lengths and rolls back allocation and identity failures" {
     try std.testing.expectError(error.InvalidAlpnProtocols, Alpn.init(std.testing.allocator, &.{""}));
-    const too_long = [_]u8{'x'} ** 256;
+    const too_long = @as([256]u8, @splat('x'));
     try std.testing.expectError(error.InvalidAlpnProtocols, Alpn.init(std.testing.allocator, &.{&too_long}));
-    const maximum = [_]u8{'x'} ** 255;
+    const maximum = @as([255]u8, @splat('x'));
     var protocols: [256][]const u8 = @splat(&maximum);
     try std.testing.expectError(error.InvalidAlpnProtocols, Alpn.init(std.testing.allocator, &protocols));
     protocols[255] = maximum[0..254];
@@ -570,12 +570,12 @@ test "TLS named identity configuration rejects ambiguous DNS names before loadin
             .server_identities = &.{.{ .server_name = name, .certificate_chain = "", .private_key = "" }},
         }));
     }
-    const label = [_]u8{'a'} ** 64;
-    const too_long = [_]u8{'a'} ** 254;
+    const label = @as([64]u8, @splat('a'));
+    const too_long = @as([254]u8, @splat('a'));
     for ([_][]const u8{ &label, &too_long }) |name|
         try std.testing.expectError(error.InvalidServerName, Identities.validate(&.{.{ .server_name = name, .certificate_chain = "", .private_key = "" }}));
     try Identities.validate(&.{.{ .server_name = "A-1.xn--bcher-kva.example", .certificate_chain = "", .private_key = "" }});
-    const longest = ([_]u8{'a'} ** 63) ++ "." ++ ([_]u8{'b'} ** 63) ++ "." ++ ([_]u8{'c'} ** 63) ++ "." ++ ([_]u8{'d'} ** 61);
+    const longest = (@as([63]u8, @splat('a'))) ++ "." ++ (@as([63]u8, @splat('b'))) ++ "." ++ (@as([63]u8, @splat('c'))) ++ "." ++ (@as([61]u8, @splat('d')));
     try std.testing.expectEqual(@as(usize, 253), longest.len);
     try Identities.validate(&.{.{ .server_name = longest, .certificate_chain = "", .private_key = "" }});
     try std.testing.expectError(error.DuplicateServerName, Context.initWithOptions(std.testing.allocator, "", "", .{

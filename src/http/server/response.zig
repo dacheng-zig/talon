@@ -27,7 +27,7 @@ pub const Response = struct {
         std.debug.assert(!self.written);
         // Informational responses cannot terminate a handler's response.
         // Protocol upgrades use Request.upgrade instead.
-        if (@intFromEnum(options.status) < 200) return error.InvalidStatus;
+        if (@backingInt(options.status) < 200) return error.InvalidStatus;
         if (!options.keep_alive) self.keep_alive = false;
         encode.writeHead(self.out, self.date, .{
             .status = options.status,
@@ -55,7 +55,7 @@ pub const Response = struct {
         buffer: []u8,
     ) !encode.ChunkedBodyWriter {
         std.debug.assert(!self.written);
-        if (@intFromEnum(options.status) < 200) return error.InvalidStatus;
+        if (@backingInt(options.status) < 200) return error.InvalidStatus;
         if (!options.keep_alive) self.keep_alive = false;
         encode.writeHead(self.out, self.date, .{
             .status = options.status,

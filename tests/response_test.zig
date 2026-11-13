@@ -60,7 +60,7 @@ test "Response: informational status cannot complete a response" {
             var out: std.Io.Writer = .fixed(&buf);
             var date: talon.http.codec.DateCache = .{};
             var res: talon.http.Response = .{ .out = &out, .date = &date, .keep_alive = true };
-            const options: talon.http.Response.RespondOptions = .{ .status = @enumFromInt(code) };
+            const options: talon.http.Response.RespondOptions = .{ .status = @fromBackingInt(@intCast(code)) };
             if (chunked) {
                 var staging: [2]u8 = undefined;
                 try std.testing.expectError(error.InvalidStatus, res.startChunked(options, &staging));

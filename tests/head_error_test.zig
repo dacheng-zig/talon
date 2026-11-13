@@ -39,7 +39,7 @@ test "HEAD: pre-handler errors suppress content without changing method case or 
                     const tail = switch (failure) {
                         .arena => " / HTTP/1.1\r\nHost: h\r\n\r\n",
                         .malformed => " / HTTP/1.1\r\nHost: h\r\nBad-Header\r\n\r\n",
-                        .oversized => " / HTTP/1.1\r\nHost: h\r\nX: " ++ "x" ** 160 ++ "\r\n\r\n",
+                        .oversized => " / HTTP/1.1\r\nHost: h\r\nX: " ++ &@as([160]u8, @splat('x')) ++ "\r\n\r\n",
                         .version => " / HTTP/9.9\r\nHost: h\r\n\r\n",
                     };
                     const request = try std.fmt.bufPrint(&request_storage, "{s}{s}", .{ method, tail });

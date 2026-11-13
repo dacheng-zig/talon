@@ -289,7 +289,7 @@ test "client: max_response_body caps an oversized response body (DoS guard)" {
             // rejects it in readResponse before streaming any body byte.
             try std.testing.expectError(
                 error.ResponseBodyTooLarge,
-                c.post(origin, "/echo", "0123456789" ** 6 ++ "0123"), // 64 bytes
+                c.post(origin, "/echo", "012345678901234567890123456789012345678901234567890123456789" ++ "0123"), // 64 bytes
             );
 
             s.shutdown();
@@ -511,7 +511,7 @@ test "client: informational head budget rejection closes without retry and zero 
     const interim = "HTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\n";
     const App = struct {
         pub fn handle(_: *@This(), _: *Request, res: *Response) !void {
-            try res.out.writeAll(interim ** 3);
+            try res.out.writeAll(interim ++ interim ++ interim);
             try res.respond("", .{});
         }
     };
@@ -615,11 +615,11 @@ test "client: response head borrows survive body reads and idle arena retention 
         const peer = try listener.accept();
         defer peer.close();
         var writer = peer.writer(&.{});
-        const value = "v" ** 8000;
+        const value = &@as([8000]u8, @splat('v'));
         try writer.interface.print("HTTP/1.1 200 Saved\r\nContent-Length: 20000\r\nx-large: {s}\r\n\r\n", .{value});
         // Fits the memory pipe, but exceeds the client read buffer so body
         // consumption rebases the original head's backing Reader storage.
-        try writer.interface.writeAll("b" ** 20000);
+        try writer.interface.writeAll(&@as([20000]u8, @splat('b')));
         try writer.interface.flush();
         try co.conn.readResponse(null, true);
         const response: BoundedClient.Response = .{ .conn = co.conn, .pool = &c.pool };
@@ -974,7 +974,7 @@ test "client: decoded collection enforces zero, exact and exceeded limits across
         .{ .encoded = &gzip_bytes, .decoded = gzip_plain, .encoding = "gzip" },
         .{ .encoded = &deflate_bytes, .decoded = deflate_plain, .encoding = "deflate" },
         .{ .encoded = &zstd_bytes, .decoded = zstd_plain, .encoding = "zstd" },
-        .{ .encoded = "x" ** 10000, .decoded = "x" ** 10000, .encoding = "identity" },
+        .{ .encoded = &@as([10000]u8, @splat('x')), .decoded = &@as([10000]u8, @splat('x')), .encoding = "identity" },
     };
     for (cases) |case| {
         for ([_]usize{ 0, case.decoded.len -| 1, case.decoded.len, case.decoded.len + 1 }) |limit| {
@@ -1008,7 +1008,7 @@ test "client: decompression amplification and JSON share the allocation bound" {
     var listener = try MemoryListener.init(std.testing.allocator, .{});
     defer listener.deinit();
     // Python gzip.compress(b'x' * 65536, mtime=0): 96 bytes expand to 64 KiB.
-    const bomb = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x01\x00\x00\x00\x80\x90\xdb\xcd\xef\x08\x0a" ++ "\x00" ** 63 ++ "\x6a\x9a\x58\xb4\x2c\x00\x00\x01\x00";
+    const bomb = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x01\x00\x00\x00\x80\x90\xdb\xcd\xef\x08\x0a" ++ &@as([63]u8, @splat('\x00')) ++ "\x6a\x9a\x58\xb4\x2c\x00\x00\x01\x00";
     for ([_]bool{ false, true }) |as_json| {
         var c = BoundedClient.init(std.testing.allocator, .{ .listener = &listener }, .{ .pool = .{ .max_per_origin = 1 } });
         defer c.deinit();
@@ -2088,7 +2088,7 @@ const HeaderEchoApp = struct {
         const ua = req.header("user-agent") orelse "<none>";
         const acc = req.header("accept") orelse "<none>";
         const ae = req.header("accept-encoding") orelse "<none>";
-        const body = try std.fmt.allocPrint(req.arena, "{s}|{s}|{s}", .{ ua, acc, ae });
+        const body = try req.arena.print("{s}|{s}|{s}", .{ ua, acc, ae });
         try res.respond(body, .{});
     }
 };
@@ -2190,7 +2190,8 @@ test "client: streaming upload (Content-Length and chunked) round-trips" {
 
     // Larger than the connection write buffer (4 KiB) so the body streams
     // across multiple buffer fills rather than riding the head's flush.
-    const payload = "talon-upload-" ** 1000;
+    const chunk = "talon-upload-";
+    const payload = &@as([1000 * chunk.len]u8, @bitCast(@as([1000][chunk.len]u8, @splat(chunk.*))));
 
     const Fns = struct {
         fn runServer(s: *Srv, l: *MemoryListener) !void {

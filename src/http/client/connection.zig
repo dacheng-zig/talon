@@ -761,8 +761,8 @@ test "readFinalHead: skips interim 1xx and returns the final head" {
 
 test "readFinalHead: repeated informational heads do not allocate persistent storage" {
     var head_budget: ResponseHeadBudget = .{ .remaining = null };
-    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ "x" ** 1000 ++ "\r\n\r\n";
-    var r: std.Io.Reader = .fixed(interim ** 100 ++ "HTTP/1.1 200 Final\r\ncontent-length: 2\r\nx-final: kept\r\n\r\nhi");
+    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ &@as([1000]u8, @splat('x')) ++ "\r\n\r\n";
+    var r: std.Io.Reader = .fixed(&@as([100 * interim.len]u8, @bitCast(@as([100][interim.len]u8, @splat(interim.*)))) ++ "HTTP/1.1 200 Final\r\ncontent-length: 2\r\nx-final: kept\r\n\r\nhi");
     var budget: [256]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&budget);
     var arena = std.heap.ArenaAllocator.init(fixed.allocator());
@@ -811,15 +811,15 @@ test "readFinalHead: cumulative bytes include informational and final heads but 
 test "readFinalHead: budget limits unterminated input and default informational floods" {
     var storage: [codec.response_parser.max_headers]codec.Header = undefined;
     var alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var partial: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ "x" ** 1000);
+    var partial: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ &@as([1000]u8, @splat('x')));
     var small: ResponseHeadBudget = .{ .remaining = 64 };
     try std.testing.expectError(error.ResponseHeadersTooLarge, readFinalHead(&partial, alloc.allocator(), &storage, &small));
-    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ "x" ** 1000 ++ "\r\n\r\n";
-    var flood: std.Io.Reader = .fixed(interim ** 100);
+    const interim = "HTTP/1.1 103 Early Hints\r\nlink: " ++ &@as([1000]u8, @splat('x')) ++ "\r\n\r\n";
+    var flood: std.Io.Reader = .fixed(&@as([100 * interim.len]u8, @bitCast(@as([100][interim.len]u8, @splat(interim.*)))));
     var budget: ResponseHeadBudget = .{};
     try std.testing.expectError(error.ResponseHeadersTooLarge, readFinalHead(&flood, alloc.allocator(), &storage, &budget));
     try std.testing.expectEqual(@as(usize, 0), alloc.allocations);
-    var oversized: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ "x" ** max_head_size ++ "\r\n\r\n");
+    var oversized: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nx-long: " ++ &@as([max_head_size]u8, @splat('x')) ++ "\r\n\r\n");
     var unlimited: ResponseHeadBudget = .{ .remaining = null };
     try std.testing.expectError(error.HeadersTooLarge, readFinalHead(&oversized, alloc.allocator(), &storage, &unlimited));
 }
@@ -914,7 +914,7 @@ test "value transport reports read and write timeout and cancellation causes" {
                 fn run(c: *C, write: bool, cancel: bool, started: *zio.ResetEvent) !void {
                     started.set();
                     if (write) {
-                        try c.writer().writeAll("x" ** 32);
+                        try c.writer().writeAll(&@as([32]u8, @splat('x')));
                         try std.testing.expectError(error.WriteFailed, c.writer().flush());
                         try std.testing.expectEqual(!cancel, c.lastWriteTimedOut());
                         try std.testing.expectEqual(cancel, c.lastWriteCanceled());

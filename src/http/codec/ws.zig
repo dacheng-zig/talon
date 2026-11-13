@@ -19,7 +19,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn isControl(self: Opcode) bool {
-        return @intFromEnum(self) & 0x8 != 0;
+        return @backingInt(self) & 0x8 != 0;
     }
 
     /// Reserved (non-control 0x3–0x7, control 0xb–0xf) opcodes are a protocol
@@ -86,7 +86,7 @@ pub fn readFrameHeader(r: *std.Io.Reader) (HeaderError || std.Io.Reader.Error)!F
     const b = try r.takeArray(2);
     const fin = b[0] & 0x80 != 0;
     const rsv = b[0] & 0x70;
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b[0])));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b[0]))));
     const masked = b[1] & 0x80 != 0;
     var len: u64 = b[1] & 0x7f;
     if (len == 126) {
@@ -139,7 +139,7 @@ pub fn writeFrame(
 ) std.Io.Writer.Error!void {
     var hdr: [14]u8 = undefined;
     var n: usize = 2;
-    hdr[0] = (if (fin) @as(u8, 0x80) else 0) | @intFromEnum(opcode);
+    hdr[0] = (if (fin) @as(u8, 0x80) else 0) | @backingInt(opcode);
     const mask_bit: u8 = if (mask != null) 0x80 else 0;
     if (payload.len < 126) {
         hdr[1] = mask_bit | @as(u8, @intCast(payload.len));
@@ -504,14 +504,14 @@ pub fn Session(comptime role: Role) type {
         /// await the peer's close and still answer ping. Concurrent close is
         /// idempotent; failed output is terminal rather than retried.
         pub fn close(self: *Self, code: CloseCode, reason: []const u8) WriteError!void {
-            if (!validCloseCode(@intFromEnum(code))) return error.InvalidCloseCode;
+            if (!validCloseCode(@backingInt(code))) return error.InvalidCloseCode;
             if (reason.len > max_control_payload - 2) return error.CloseReasonTooLarge;
             if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
             try self.lockWriter();
             defer self.write_mutex.unlock();
             if (self.close_sent) return;
             var buf: [max_control_payload]u8 = undefined;
-            std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
+            std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
             @memcpy(buf[2..][0..reason.len], reason);
             try self.sendFrame(.close, true, buf[0 .. 2 + reason.len]);
             self.close_sent = true;

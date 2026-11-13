@@ -61,7 +61,7 @@ test "limits: minimum HTTP head window serves valid input and rejects full overs
                 var writer = raw.writer(&.{});
                 writer.setTimeout(.fromSeconds(2));
                 if (too_large) {
-                    const input = [_]u8{'a'} ** 129;
+                    const input = @as([129]u8, @splat('a'));
                     try writer.interface.writeAll(&input);
                 } else try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: h\r\n\r\n");
                 var buf: [256]u8 = undefined;
@@ -218,7 +218,7 @@ test "limits: response write timeout releases a connection whose peer never read
         write_failed: bool = false,
         pub fn handle(self: *@This(), _: *talon.http.Request, res: *talon.http.Response) !void {
             defer self.done.set();
-            const payload = [_]u8{'x'} ** 8192;
+            const payload = @as([8192]u8, @splat('x'));
             res.respond(&payload, .{}) catch {
                 self.write_failed = true;
             };

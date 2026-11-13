@@ -29,7 +29,7 @@ const std = @import("std");
 ///   - `provides(F)` — comptime: whether any middleware provides capability F
 pub fn chain(comptime Ctx: type, comptime middlewares: anytype) type {
     comptime validate(Ctx, middlewares);
-    const count = @typeInfo(@TypeOf(middlewares)).@"struct".fields.len;
+    const count = @typeInfo(@TypeOf(middlewares)).@"struct".field_names.len;
 
     return struct {
         /// Comptime capability query: does any middleware in this chain
@@ -91,7 +91,7 @@ fn validate(comptime Ctx: type, comptime middlewares: anytype) void {
             @typeName(Mws));
     }
 
-    inline for (info.@"struct".fields, 0..) |_, i| {
+    inline for (info.@"struct".field_names, 0..) |_, i| {
         const mw = middlewares[i];
         const Mw = @TypeOf(mw);
         if (Mw == type) {
@@ -137,15 +137,15 @@ fn validateStructMiddleware(
 
 fn validateFnSignature(comptime Ctx: type, comptime F: type, comptime index: usize, comptime name: []const u8) void {
     const fn_info = @typeInfo(F).@"fn";
-    if (fn_info.params.len != 2) {
+    if (fn_info.param_types.len != 2) {
         @compileError(std.fmt.comptimePrint(
             "talon.chain: middleware #{d} ({s}) must take exactly (ctx: *Ctx, next: anytype), found {d} parameter(s)",
-            .{ index, name, fn_info.params.len },
+            .{ index, name, fn_info.param_types.len },
         ));
     }
     // First param is either the concrete *Ctx or anytype (generic, reusable
     // across context types). anytype shows up as a null param type.
-    if (fn_info.params[0].type) |P| {
+    if (fn_info.param_types[0]) |P| {
         if (P != *Ctx) {
             @compileError(std.fmt.comptimePrint(
                 "talon.chain: middleware #{d} ({s}) first parameter must be *{s}, got {s}",

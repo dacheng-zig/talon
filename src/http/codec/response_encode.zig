@@ -47,7 +47,7 @@ pub fn formatHttpDate(secs: u64, out: *[29]u8) void {
     w.print("{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
         weekdays[weekday],
         month_day.day_index + 1,
-        months[@intFromEnum(month_day.month) - 1],
+        months[@backingInt(month_day.month) - 1],
         year_day.year,
         day_secs.getHoursIntoDay(),
         day_secs.getMinutesIntoHour(),
@@ -72,7 +72,7 @@ pub const EncodeError = error{
 };
 
 pub fn statusAllowsBody(status: Status) bool {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     return code >= 200 and code != 204 and code != 205 and code != 304;
 }
 
@@ -92,10 +92,10 @@ pub fn writeHead(w: *std.Io.Writer, date: *DateCache, options: HeadOptions) (std
         if (parser.isReservedFramingHeader(h.name) or std.ascii.eqlIgnoreCase(h.name, "date"))
             return error.InvalidHeader;
     }
-    const code = @intFromEnum(options.status);
+    const code = @backingInt(options.status);
     const phrase = options.status.phrase() orelse "";
     try w.print("HTTP/1.1 {d} {s}\r\ndate: {s}\r\n", .{ code, phrase, date.get() });
-    if (@intFromEnum(options.status) == 205) {
+    if (@backingInt(options.status) == 205) {
         try w.writeAll("content-length: 0\r\n");
     } else if (!statusAllowsBody(options.status)) {
         // Omit framing for 1xx/204/304. Representation metadata on 304 is

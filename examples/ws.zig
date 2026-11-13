@@ -14,8 +14,7 @@ const App = struct {
             return res.respond("talon websocket echo — connect to /ws\n", .{});
         }
         var socket = talon.http.ws.upgrade(req, .{}) catch |err| switch (err) {
-            error.NotWebSocket, error.MissingKey, error.UnsupportedVersion =>
-                return res.respond("expected a WebSocket upgrade\n", .{ .status = .bad_request }),
+            error.NotWebSocket, error.MissingKey, error.UnsupportedVersion => return res.respond("expected a WebSocket upgrade\n", .{ .status = .bad_request }),
             else => return err,
         };
         while (try socket.read()) |msg| switch (msg) {

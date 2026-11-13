@@ -46,7 +46,7 @@ test "pool budget: global cap covers distinct origins and reuse independently of
     const peer = try listener.accept();
     defer peer.close();
     try std.testing.expectError(error.PoolQueueFull, c.pool.checkout(b, .none));
-    const long_host = [_]u8{'h'} ** 600;
+    const long_host = @as([600]u8, @splat('h'));
     try std.testing.expectError(error.PoolQueueFull, c.pool.checkout(.{ .host = &long_host, .port = 80 }, .none));
     try std.testing.expectEqual(@as(u64, 1), c.poolStats().created);
     c.pool.checkin(first.conn, true);
@@ -251,7 +251,7 @@ test "pool budget: explicit unlimited and long-origin limits cannot be bypassed"
         .max_waiters = 0,
     } });
     defer c.deinit();
-    const long_host = [_]u8{'h'} ** 600;
+    const long_host = @as([600]u8, @splat('h'));
     const origin: Origin = .{ .host = &long_host, .port = 80 };
     const held = try c.pool.checkout(origin, .none);
     const peer = try listener.accept();

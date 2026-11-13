@@ -40,7 +40,7 @@ test "WS: outbound arguments are rejected without output and valid boundary payl
         var ping: [126]u8 = @splat(0xff);
         try std.testing.expectError(error.ControlPayloadTooLarge, s.writePing(&ping));
         for ([_]u16{ 0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535 }) |code| {
-            try std.testing.expectError(error.InvalidCloseCode, s.close(@enumFromInt(code), ""));
+            try std.testing.expectError(error.InvalidCloseCode, s.close(@fromBackingInt(@intCast(code)), ""));
         }
         var reason: [124]u8 = @splat('a');
         try std.testing.expectError(error.CloseReasonTooLarge, s.close(.normal, &reason));
@@ -55,12 +55,12 @@ test "WS: outbound arguments are rejected without output and valid boundary payl
         try s.writePing(ping[0..125]);
         @memset(reason[0..120], 'a');
         @memcpy(reason[120..123], "中");
-        try s.close(@enumFromInt(3000), reason[0..123]);
+        try s.close(@fromBackingInt(@intCast(3000)), reason[0..123]);
         const written = writer.buffered().len;
         try s.close(.normal, "");
         try std.testing.expectError(error.InvalidUtf8, s.writeText("\xff"));
         try std.testing.expectError(error.ControlPayloadTooLarge, s.writePing(&ping));
-        try std.testing.expectError(error.InvalidCloseCode, s.close(@enumFromInt(1005), ""));
+        try std.testing.expectError(error.InvalidCloseCode, s.close(@fromBackingInt(@intCast(1005)), ""));
         try std.testing.expectError(error.Closed, s.writeText("valid"));
         try std.testing.expectEqual(written, writer.buffered().len);
         var wire: std.Io.Reader = .fixed(writer.buffered());
@@ -83,7 +83,7 @@ test "WS: valid close code boundaries and argument errors before failed writer s
             var reader: std.Io.Reader = .fixed("");
             var msg_buf: [1]u8 = undefined;
             var s: ws.Session(role) = .{ .reader = &reader, .writer = &writer, .msg_buf = &msg_buf };
-            try s.close(@enumFromInt(code), "");
+            try s.close(@fromBackingInt(@intCast(code)), "");
             var wire: std.Io.Reader = .fixed(writer.buffered());
             var payload: [2]u8 = undefined;
             std.mem.writeInt(u16, &payload, code, .big);
@@ -95,7 +95,7 @@ test "WS: valid close code boundaries and argument errors before failed writer s
         var s: ws.Session(role) = .{ .reader = &reader, .writer = &writer, .msg_buf = &msg_buf };
         try std.testing.expectError(error.WriteFailed, s.writeBinary("payload"));
         try std.testing.expectError(error.InvalidUtf8, s.writeText("\xff"));
-        try std.testing.expectError(error.InvalidCloseCode, s.close(@enumFromInt(1006), ""));
+        try std.testing.expectError(error.InvalidCloseCode, s.close(@fromBackingInt(@intCast(1006)), ""));
         try std.testing.expectError(error.WriteFailed, s.close(.normal, ""));
     }
 }
@@ -208,13 +208,13 @@ test "WS: canceling a queued sender leaves the active frame and later sends inta
     var session: ws.Session(.server) = .{ .reader = &reader, .writer = &writer.interface, .msg_buf = &.{} };
     const F = struct {
         fn first(s: *ws.Session(.server)) !void {
-            try s.writeBinary(&([_]u8{'a'} ** 2500));
+            try s.writeBinary(&(@as([2500]u8, @splat('a'))));
         }
         fn canceled(s: *ws.Session(.server)) !void {
             try std.testing.expectError(error.Canceled, s.writeText("must not appear"));
         }
         fn consume(r: *std.Io.Reader) !void {
-            try expectFrame(r, .server, .binary, &([_]u8{'a'} ** 2500));
+            try expectFrame(r, .server, .binary, &(@as([2500]u8, @splat('a'))));
             try expectFrame(r, .server, .text, "later");
         }
     };
@@ -249,7 +249,7 @@ test "WS: cancellation during frame output prevents all subsequent frame writes"
     var session: ws.Session(.server) = .{ .reader = &reader, .writer = &writer.interface, .msg_buf = &.{} };
     const F = struct {
         fn send(s: *ws.Session(.server)) !void {
-            try std.testing.expectError(error.WriteFailed, s.writeBinary(&([_]u8{'x'} ** 2500)));
+            try std.testing.expectError(error.WriteFailed, s.writeBinary(&(@as([2500]u8, @splat('x')))));
         }
     };
     var send = try zio.spawn(F.send, .{&session});

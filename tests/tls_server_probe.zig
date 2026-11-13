@@ -114,8 +114,8 @@ fn runWithWindow(comptime Proto: type, gpa: std.mem.Allocator, context: *tls.Con
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 4 and args.len != 5) return error.ExpectedCertificateKeyDuration;
-    const cert = try init.arena.allocator().dupeZ(u8, args[1]);
-    const key = try init.arena.allocator().dupeZ(u8, args[2]);
+    const cert = try init.arena.allocator().dupeSentinel(u8, args[1], 0);
+    const key = try init.arena.allocator().dupeSentinel(u8, args[2], 0);
     const duration = try std.fmt.parseInt(usize, args[3], 10);
     if (duration < 1000 or duration > 10000) return error.InvalidDuration;
     const enable_alpn = args.len == 5 and std.mem.eql(u8, args[4], "alpn");
@@ -123,8 +123,8 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     var alpha_name = "alpha.localhost".*;
     const identities: []const tls.Context.NamedIdentity = if (enable_sni) &.{
-        .{ .server_name = &alpha_name, .certificate_chain = try std.fmt.allocPrintSentinel(arena, "{s}.alpha.pem", .{cert}, 0), .private_key = try std.fmt.allocPrintSentinel(arena, "{s}.alpha.pem", .{key}, 0) },
-        .{ .server_name = "beta.localhost", .certificate_chain = try std.fmt.allocPrintSentinel(arena, "{s}.beta.pem", .{cert}, 0), .private_key = try std.fmt.allocPrintSentinel(arena, "{s}.beta.pem", .{key}, 0) },
+        .{ .server_name = &alpha_name, .certificate_chain = try arena.printSentinel("{s}.alpha.pem", .{cert}, 0), .private_key = try arena.printSentinel("{s}.alpha.pem", .{key}, 0) },
+        .{ .server_name = "beta.localhost", .certificate_chain = try arena.printSentinel("{s}.beta.pem", .{cert}, 0), .private_key = try arena.printSentinel("{s}.beta.pem", .{key}, 0) },
     } else &.{};
     const options: tls.Context.Options = .{
         .alpn_protocols = if (enable_alpn or enable_sni) &.{"http/1.1"} else &.{},

@@ -32,7 +32,7 @@ fn roundTrip(listener: anytype, dialer: anytype, target: @TypeOf(dialer).Target)
             var writer = raw.writer(&.{});
             writer.setTimeout(.fromSeconds(2));
             try writer.interface.writeInt(u16, 4096, .big);
-            try writer.interface.writeAll("x" ** 4096);
+            try writer.interface.writeAll(&@as([4096]u8, @splat('x')));
             var buffer: [17]u8 = undefined;
             var reader = raw.reader(&buffer);
             reader.setTimeout(.fromSeconds(2));

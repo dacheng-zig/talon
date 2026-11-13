@@ -245,7 +245,7 @@ test "PipeWriter: duration renews on progress but deadline bounds the transfer" 
         var writer = PipeWriter.init(&pipe, &buffer);
         const timeout: zio.Timeout = .fromMilliseconds(200);
         writer.setTimeout(if (absolute) timeout.toDeadline() else timeout);
-        const payload = [_]u8{'x'} ** 512;
+        const payload = @as([512]u8, @splat('x'));
         if (absolute) {
             try std.testing.expectError(error.WriteFailed, writer.interface.writeAll(&payload));
             try std.testing.expectEqual(error.Timeout, writer.err.?);

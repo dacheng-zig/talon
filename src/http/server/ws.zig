@@ -262,7 +262,7 @@ test "read: invalid UTF-8 text is rejected with close 1007" {
     try std.testing.expectEqual(ws.Opcode.close, h.opcode);
     var body: [2]u8 = undefined;
     try rr.readSliceAll(&body);
-    try std.testing.expectEqual(@as(u16, @intFromEnum(ws.CloseCode.invalid_payload)), std.mem.readInt(u16, &body, .big));
+    try std.testing.expectEqual(@as(u16, @backingInt(ws.CloseCode.invalid_payload)), std.mem.readInt(u16, &body, .big));
 }
 
 test "read: close with invalid code answers 1002" {
@@ -280,7 +280,7 @@ test "read: close with invalid code answers 1002" {
     try std.testing.expectEqual(ws.Opcode.close, h.opcode);
     var body: [2]u8 = undefined;
     try rr.readSliceAll(&body);
-    try std.testing.expectEqual(@as(u16, @intFromEnum(ws.CloseCode.protocol_error)), std.mem.readInt(u16, &body, .big));
+    try std.testing.expectEqual(@as(u16, @backingInt(ws.CloseCode.protocol_error)), std.mem.readInt(u16, &body, .big));
 }
 
 test "read: an unmasked client frame is a protocol error" {

@@ -51,7 +51,7 @@ test "StreamServer: custom framing uses independent small and large buffer capac
                 var writer = raw.writer(&.{});
                 writer.setTimeout(.fromSeconds(2));
                 try writer.interface.writeInt(u32, @intCast(payload_len), .big);
-                const fragment = [_]u8{'x'} ** 997;
+                const fragment = @as([997]u8, @splat('x'));
                 var left = payload_len;
                 while (left != 0) {
                     const n = @min(left, fragment.len);

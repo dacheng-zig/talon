@@ -68,7 +68,7 @@ test "findHeadEnd: locates terminator across refills" {
 }
 
 test "findHeadEnd: oversized head rejected, clean close detected" {
-    const big = [_]u8{'a'} ** 128;
+    const big = @as([128]u8, @splat('a'));
     var r: std.Io.Reader = .fixed(&big);
     try std.testing.expectError(error.HeadersTooLarge, findHeadEnd(&r, 64, null));
 

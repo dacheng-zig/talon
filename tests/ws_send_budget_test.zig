@@ -60,7 +60,7 @@ test "WS send admission: independent limits, canceled waiters and automatic pong
                 var session: S = .{ .reader = &reader, .writer = &writer.interface, .msg_buf = &msg_buf, .send_limits = limits };
                 const F = struct {
                     fn first(s: *S) !void {
-                        try s.writeBinary(&([_]u8{'a'} ** 2500));
+                        try s.writeBinary(&(@as([2500]u8, @splat('a'))));
                     }
                     fn canceled(s: *S) !void {
                         try std.testing.expectError(error.Canceled, s.writeText("abcdefghij"));
@@ -75,7 +75,7 @@ test "WS send admission: independent limits, canceled waiters and automatic pong
                         var payload: [2500]u8 = undefined;
                         const first_frame = try takeFrame(r, role, &payload);
                         try std.testing.expectEqual(ws.Opcode.binary, first_frame.opcode);
-                        try std.testing.expectEqualSlices(u8, &([_]u8{'a'} ** 2500), &payload);
+                        try std.testing.expectEqualSlices(u8, &(@as([2500]u8, @splat('a'))), &payload);
                         var text = false;
                         var pong = false;
                         for (0..2) |_| {
@@ -149,10 +149,10 @@ test "WS send admission: racing producers cannot exceed either reservation and j
             var session: S = .{ .reader = &reader, .writer = &writer.interface, .msg_buf = &.{}, .send_limits = .{ .max_data_sends = 4, .max_data_bytes = 400 } };
             const F = struct {
                 fn first(s: *S) !void {
-                    try s.writeBinary(&([_]u8{'z'} ** 100));
+                    try s.writeBinary(&(@as([100]u8, @splat('z'))));
                 }
                 fn attempt(s: *S) !void {
-                    s.writeBinary(&([_]u8{'z'} ** 100)) catch |err| switch (err) {
+                    s.writeBinary(&(@as([100]u8, @splat('z')))) catch |err| switch (err) {
                         error.SendLimitExceeded => return,
                         else => return err,
                     };
@@ -163,7 +163,7 @@ test "WS send admission: racing producers cannot exceed either reservation and j
                         const h = try takeFrame(r, role, &payload);
                         try std.testing.expectEqual(ws.Opcode.binary, h.opcode);
                         try std.testing.expectEqual(@as(u64, 100), h.payload_len);
-                        try std.testing.expectEqualSlices(u8, &([_]u8{'z'} ** 100), &payload);
+                        try std.testing.expectEqualSlices(u8, &(@as([100]u8, @splat('z'))), &payload);
                     }
                 }
             };
@@ -205,7 +205,7 @@ test "WS send admission: partial output cancellation releases budget but preserv
         var s: ws.Session(.server) = .{ .reader = &reader, .writer = &writer.interface, .msg_buf = &.{}, .send_limits = .{ .max_data_sends = 1, .max_data_bytes = 2500 } };
         const F = struct {
             fn send(session: *ws.Session(.server)) !void {
-                try std.testing.expectError(error.WriteFailed, session.writeBinary(&([_]u8{'x'} ** 2500)));
+                try std.testing.expectError(error.WriteFailed, session.writeBinary(&(@as([2500]u8, @splat('x')))));
             }
         };
         var sender = try zio.spawn(F.send, .{&s});

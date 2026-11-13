@@ -40,7 +40,7 @@ fn fetch(c: *http.TlsClient, url: []const u8) !void {
     if (response.status() != 200) return error.UnexpectedStatus;
     const body = try response.readAllAlloc(std.heap.page_allocator, 17);
     defer std.heap.page_allocator.free(body);
-    if (!std.mem.eql(u8, body, "x" ** 17)) return error.UnexpectedBody;
+    if (!std.mem.eql(u8, body, &@as([17]u8, @splat('x')))) return error.UnexpectedBody;
 }
 
 pub fn main(init: std.process.Init) !void {

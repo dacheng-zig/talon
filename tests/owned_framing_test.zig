@@ -77,7 +77,7 @@ test "OwnedLengthPrefixed: engine echoes large frames through a tiny window and 
                 var writer = raw.writer(&.{});
                 writer.setTimeout(.fromSeconds(2));
                 try writer.interface.writeInt(u32, 8192, .big);
-                const fragment = [_]u8{'x'} ** 137;
+                const fragment = @as([137]u8, @splat('x'));
                 var left: usize = if (partial) 3 else 8192;
                 while (left != 0) {
                     const n = @min(left, fragment.len);

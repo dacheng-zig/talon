@@ -248,7 +248,7 @@ pub fn Pool(comptime Connector: type) type {
             if (self.config.max_per_origin != null) {
                 // Unpoolable long keys still obey admission. This temporary
                 // key is copied into referenced origin state, never retained.
-                const owned = if (key == null) try std.fmt.allocPrint(self.gpa, "{s}://{s}:{d}", .{
+                const owned = if (key == null) try self.gpa.print("{s}://{s}:{d}", .{
                     @tagName(origin.scheme), origin.host, origin.port,
                 }) else null;
                 defer if (owned) |k| self.gpa.free(k);
